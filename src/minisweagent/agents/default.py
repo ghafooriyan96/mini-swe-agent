@@ -12,6 +12,8 @@ from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
+from minisweagent.agents.utils.loop_detection import LoopDetectionConfig, LoopDetector
+from minisweagent.agents.utils.test_feedback import TestFeedbackConfig, TestOutputAnalyzer
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
 from minisweagent.utils.serialize import recursive_merge
 
@@ -33,6 +35,10 @@ class AgentConfig(BaseModel):
     """Exit after this many format errors in a row (0 = no limit)."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
+    loop_detection: LoopDetectionConfig = LoopDetectionConfig()
+    """Loop detection configuration."""
+    test_feedback: TestFeedbackConfig = TestFeedbackConfig()
+    """Structured test feedback configuration."""
 
 
 class DefaultAgent:
@@ -48,6 +54,10 @@ class DefaultAgent:
         self.n_calls = 0
         self.n_consecutive_format_errors = 0
         self._start_time = time.time()
+        self.loop_detector = LoopDetector(self.config.loop_detection) if self.config.loop_detection.enabled else None
+        self.test_feedback_analyzer = (
+            TestOutputAnalyzer(self.config.test_feedback) if self.config.test_feedback.enabled else None
+        )
 
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
@@ -89,6 +99,10 @@ class DefaultAgent:
         """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
+        if self.loop_detector is not None:
+            self.loop_detector.reset()
+        if self.test_feedback_analyzer is not None:
+            self.test_feedback_analyzer.reset()
         self.add_messages(
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
             self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
@@ -151,9 +165,20 @@ class DefaultAgent:
         self.add_messages(message)
         return message
 
+    def post_process_output(self, action: dict, output: dict) -> dict:
+        """Process output through test feedback analyzer and loop detector if active."""
+        if self.test_feedback_analyzer is not None:
+            output = self.test_feedback_analyzer.process(action, output)
+        if self.loop_detector is not None:
+            output = self.loop_detector.process(action, output, env=self.env)
+        return output
+
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
-        outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
+        outputs = []
+        for action in message.get("extra", {}).get("actions", []):
+            output = self.post_process_output(action, self.env.execute(action))
+            outputs.append(output)
         return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
 
     def serialize(self, *extra_dicts) -> dict:
@@ -177,6 +202,16 @@ class DefaultAgent:
             "messages": self.messages,
             "trajectory_format": "mini-swe-agent-1.1",
         }
+        if self.loop_detector is not None:
+            agent_data["info"]["loop_detection_stats"] = {
+                "loop_detections": self.loop_detector.total_loop_detections,
+                "interventions": self.loop_detector.total_interventions,
+            }
+        if self.test_feedback_analyzer is not None:
+            agent_data["info"]["test_feedback_stats"] = {
+                "feedbacks_generated": self.test_feedback_analyzer.total_feedbacks_generated,
+                "failed_tests_detected": self.test_feedback_analyzer.total_failed_tests_detected,
+            }
         return recursive_merge(agent_data, self.model.serialize(), self.env.serialize(), *extra_dicts)
 
     def save(self, path: Path | None, *extra_dicts) -> dict:

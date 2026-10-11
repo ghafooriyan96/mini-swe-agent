@@ -129,7 +129,8 @@ class InteractiveAgent(DefaultAgent):
         try:
             self._ask_confirmation_or_interrupt(commands)
             for action in actions:
-                outputs.append(self.env.execute(action))
+                output = self.post_process_output(action, self.env.execute(action))
+                outputs.append(output)
         except Submitted as e:
             self._check_for_new_task_or_submit(e)
         finally:

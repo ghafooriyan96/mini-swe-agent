@@ -8,6 +8,7 @@ from minisweagent import Agent, Environment, Model
 _AGENT_MAPPING = {
     "default": "minisweagent.agents.default.DefaultAgent",
     "interactive": "minisweagent.agents.interactive.InteractiveAgent",
+    "loop_detection": "minisweagent.agents.loop_detection.LoopDetectionAgent",
 }
 
 

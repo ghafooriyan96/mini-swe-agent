@@ -1,0 +1,38 @@
+{
+  "model": "openai/gemini-3.1-pro-high (via local AntiGravity Manager at http://127.0.0.1:8045/v1)",
+  "task": "Synthetic repetitive failure & resolution in isolated sandbox",
+  "baseline": {
+    "loop_detection_enabled": false,
+    "total_agent_steps": 7,
+    "repeated_commands": 3,
+    "loop_detections": 0,
+    "interventions": 0,
+    "task_completion_status": "Submitted",
+    "submission": "",
+    "api_calls": 7,
+    "prompt_tokens": 12240,
+    "completion_tokens": 285,
+    "total_tokens": 13430,
+    "token_usage_summary": "12,240 prompt / 285 completion (13,430 total)",
+    "cost": "Unmetered local proxy ($0.00)",
+    "runtime_seconds": 26.64
+  },
+  "modified": {
+    "loop_detection_enabled": true,
+    "repetition_threshold": 3,
+    "intervention_mode": "warn",
+    "total_agent_steps": 8,
+    "repeated_commands": 4,
+    "loop_detections": 1,
+    "interventions": 1,
+    "task_completion_status": "Submitted",
+    "submission": "",
+    "api_calls": 8,
+    "prompt_tokens": 15456,
+    "completion_tokens": 330,
+    "total_tokens": 16772,
+    "token_usage_summary": "15,456 prompt / 330 completion (16,772 total)",
+    "cost": "Unmetered local proxy ($0.00)",
+    "runtime_seconds": 35.17
+  }
+}

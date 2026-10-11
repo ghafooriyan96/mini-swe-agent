@@ -9,6 +9,14 @@ traj.json
 .claude/**
 .vscode/**
 
+# Research experiments: raw model trajectories, execution logs, and generated run directories
+**/trajectories/
+**/logs/
+traj_*.json
+trajectory_*.json
+experiments/**/runs/
+experiments/**/interrupted_run/
+
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
 
