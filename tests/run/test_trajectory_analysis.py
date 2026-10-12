@@ -199,8 +199,8 @@ def test_report_reproducibility_and_cli(tmp_path: Path):
 
     data = json.loads(json_path.read_text())
     assert data["total_evaluated_runs"] == 2
-    assert "task_e1_multifile" in data["paired_comparisons"]
-    assert "Six-Run Master Comparison Table" in md_path.read_text()
+    assert "task_e1_multifile_rep1" in data["paired_comparisons"]
+    assert "Master Comparison Table" in md_path.read_text()
 
     # Test CLI execution with Typer runner
     cli_out = tmp_path / "cli_out"
@@ -229,3 +229,140 @@ def test_same_history_acm_reduction_separation():
     # G run has no same-history ACM reduction
     assert res_g["acm_enabled"] is False
     assert res_g["same_history_context_reduction"] is None
+
+
+DATASET_20STEP = Path("experiments/phase2_test_feedback/runs/run_phase3_20261012_125546")
+
+
+def test_multi_repetition_dataset_twelve_runs(tmp_path: Path):
+    """Verify twelve runs produce exactly six matched pairs without overwriting repetitions."""
+    suite = run_trajectory_analysis_suite(
+        run_dirs=[DATASET_20STEP],
+        output_dir=tmp_path / "out",
+        skip_replay=True,
+    )
+    assert suite["total_evaluated_runs"] == 12
+    assert len(suite["paired_comparisons"]) == 6
+
+    expected_keys = {
+        "task_e1_multifile_rep1",
+        "task_e1_multifile_rep2",
+        "task_e2_multifailure_rep1",
+        "task_e2_multifailure_rep2",
+        "task_e3_verbose_investigation_rep1",
+        "task_e3_verbose_investigation_rep2",
+    }
+    assert set(suite["paired_comparisons"].keys()) == expected_keys
+
+    # Verify both G and H resolved across all 6 pairs
+    assert all(p["g_resolved"] and p["h_resolved"] for p in suite["paired_comparisons"].values())
+
+    # Verify run identity fields across all 12 runs
+    for r in suite["runs"]:
+        assert r["repetition"] in (1, 2)
+        assert r["step_limit"] == 20
+        assert r["run_id"] == "run_phase3_20261012_125546"
+        assert r["exit_status"] == "Submitted"
+        assert r["pair_id"].startswith("pair_")
+
+
+def test_e3_h_both_repetitions_analyzed():
+    """Verify separate independent step-by-step analyses for E3 H Rep 1 and Rep 2."""
+    e3_h_rep1 = DATASET_20STEP / "trajectories" / "traj_task_e3_verbose_investigation_H_context_compaction_rep1.json"
+    e3_h_rep2 = DATASET_20STEP / "trajectories" / "traj_task_e3_verbose_investigation_H_context_compaction_rep2.json"
+
+    res1 = analyze_single_trajectory(e3_h_rep1, skip_replay=False)
+    assert res1["repetition"] == 1
+    assert res1["step_limit"] == 20
+    assert res1["exit_status"] == "Submitted"
+    assert res1["api_calls"] == 19
+    assert res1["first_step_modified_production_code"] == 13
+    assert res1["first_step_independently_correct"] == 13
+    assert res1["step_correctness"] == ["FAIL"] * 12 + ["PASS"] * 7
+
+    res2 = analyze_single_trajectory(e3_h_rep2, skip_replay=False)
+    assert res2["repetition"] == 2
+    assert res2["step_limit"] == 20
+    assert res2["exit_status"] == "Submitted"
+    assert res2["api_calls"] == 19
+    assert res2["first_step_modified_production_code"] == 14
+    assert res2["first_step_independently_correct"] == 14
+    assert res2["step_correctness"] == ["FAIL"] * 13 + ["PASS"] * 6
+
+    # Verify submission sentinels at Step 19
+    assert res1["steps"][18]["is_submission"] is True
+    assert res1["steps"][18]["command_exit_code"] == -1
+    assert res1["steps"][18]["independent_patch_correctness"] == "PASS"
+
+    assert res2["steps"][18]["is_submission"] is True
+    assert res2["steps"][18]["command_exit_code"] == -1
+    assert res2["steps"][18]["independent_patch_correctness"] == "PASS"
+
+
+def test_dynamic_narrative_no_stale_15_step_text(tmp_path: Path):
+    """Verify 20-step report generates dynamic narrative and contains no stale pilot statements."""
+    suite = run_trajectory_analysis_suite(
+        run_dirs=[DATASET_20STEP],
+        output_dir=tmp_path / "out",
+        skip_replay=True,
+    )
+    md_text = (tmp_path / "out" / "phase3_trajectory_analysis.md").read_text()
+
+    # Must NOT contain stale 15-step narrative
+    assert "LimitsExceeded at Step 15" not in md_text
+    assert "Step limit reached at Step 15" not in md_text
+    assert "first correct patch at Step 11" not in md_text
+    assert "Submission failure" not in md_text
+
+    # Must contain 20-step dynamic narrative
+    assert "Step Limit**: 20" in md_text
+    assert "Submitted successfully" in md_text
+    assert "12-Run Master Comparison Table" in md_text
+    assert "### 3.1 E3 H Repetition 1" in md_text
+    assert "### 3.2 E3 H Repetition 2" in md_text
+
+
+def test_acm_telemetry_reconciliation_across_runs():
+    """Verify live agent cumulative savings vs step-level action savings vs counterfactual."""
+    e1_h_rep2 = DATASET_20STEP / "trajectories" / "traj_task_e1_multifile_H_context_compaction_rep2.json"
+    e1_h_rep1 = DATASET_20STEP / "trajectories" / "traj_task_e1_multifile_H_context_compaction_rep1.json"
+
+    res_rep2 = analyze_single_trajectory(e1_h_rep2, skip_replay=True)
+    recon2 = res_rep2["acm_telemetry_reconciliation"]
+    assert recon2["live_cumulative_tokens_saved"] == 4118
+    assert recon2["step_level_tokens_saved"] == 3502
+    assert recon2["offline_counterfactual_tokens_saved"] == 3502
+    assert recon2["difference_tokens"] == 616
+    assert recon2["format_error_retries"] == 1
+
+    res_rep1 = analyze_single_trajectory(e1_h_rep1, skip_replay=True)
+    recon1 = res_rep1["acm_telemetry_reconciliation"]
+    assert recon1["live_cumulative_tokens_saved"] == 3692
+    assert recon1["step_level_tokens_saved"] == 3692
+    assert recon1["offline_counterfactual_tokens_saved"] == 3692
+    assert recon1["difference_tokens"] == 0
+    assert recon1["format_error_retries"] == 0
+
+
+def test_submission_sentinel_classification():
+    """Verify submission sentinel is not treated as a shell failure."""
+    e1_h_rep1 = DATASET_20STEP / "trajectories" / "traj_task_e1_multifile_H_context_compaction_rep1.json"
+    res = analyze_single_trajectory(e1_h_rep1, skip_replay=True)
+    submit_step = res["steps"][-1]
+    assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in submit_step["command"]
+    assert submit_step["is_submission"] is True
+    assert submit_step["command_exit_code"] == -1
+
+
+def test_backward_compatibility_with_six_run_pilot(tmp_path: Path):
+    """Verify original six-run pilot remains completely compatible with dynamic reporting."""
+    suite = run_trajectory_analysis_suite(
+        run_dirs=DEFAULT_PILOT_RUN_DIRS,
+        output_dir=tmp_path / "pilot_out",
+        skip_replay=True,
+    )
+    assert suite["total_evaluated_runs"] == 6
+    assert len(suite["paired_comparisons"]) == 3
+    md_text = (tmp_path / "pilot_out" / "phase3_trajectory_analysis.md").read_text()
+    assert "Six-Run Master Comparison Table" in md_text
+    assert "Step limit reached at Step 15" in md_text
