@@ -37,6 +37,15 @@ VALID_TERMINAL_STATUSES = {
     "RepeatedFormatError",
 }
 
+CONFIG_FEATURE_MATRIX: dict[str, dict[str, bool]] = {
+    "A_baseline": {"loop_detection": False, "test_feedback": False, "adaptive_context": False},
+    "B_loop_detection_only": {"loop_detection": True, "test_feedback": False, "adaptive_context": False},
+    "C_test_feedback_only": {"loop_detection": False, "test_feedback": True, "adaptive_context": False},
+    "D_combined": {"loop_detection": True, "test_feedback": True, "adaptive_context": False},
+    "G_context_baseline": {"loop_detection": True, "test_feedback": True, "adaptive_context": False},
+    "H_context_compaction": {"loop_detection": True, "test_feedback": True, "adaptive_context": True},
+}
+
 
 class SandboxLock:
     """File-based lock to prevent concurrent runs against the same sandbox."""
@@ -397,6 +406,220 @@ def extract_trajectory_test_metrics(messages: list[dict]) -> dict:
     }
 
 
+def extract_acm_metrics(
+    messages: list[dict],
+    info: dict | None = None,
+    expected_config: str | None = None,
+) -> tuple[dict, list[str]]:
+    """Extract and validate Adaptive Context Management (ACM) telemetry without double counting.
+
+    Cross-checks cumulative trajectory info against per-turn assistant message deltas.
+    Returns (metrics_dict, data_quality_issues).
+    """
+    data_quality_issues: list[str] = []
+    info_dict = info if isinstance(info, dict) else {}
+
+    # Check configuration and metadata flags
+    agent_cfg = info_dict.get("config", {}).get("agent", {}) if isinstance(info_dict.get("config"), dict) else {}
+    acm_cfg = agent_cfg.get("adaptive_context", {}) if isinstance(agent_cfg, dict) else {}
+    cfg_enabled = acm_cfg.get("enabled", False) if isinstance(acm_cfg, dict) else False
+
+    cm_stats = info_dict.get("context_manager_stats")
+    info_enabled = cm_stats.get("enabled", False) if isinstance(cm_stats, dict) else False
+
+    # Check if any message explicitly recorded ACM telemetry with enabled=True
+    msg_enabled = False
+    for m in messages:
+        if isinstance(m, dict):
+            extra = m.get("extra")
+            if isinstance(extra, dict) and isinstance(extra.get("context_compaction"), dict):
+                if extra["context_compaction"].get("enabled") is True:
+                    msg_enabled = True
+                    break
+
+    # Determine acm_enabled flag
+    if expected_config == "H_context_compaction":
+        acm_enabled = True
+    elif expected_config in ("A_baseline", "B_loop_detection_only", "C_test_feedback_only", "D_combined", "G_context_baseline"):
+        acm_enabled = False
+    else:
+        acm_enabled = bool(cfg_enabled or info_enabled or msg_enabled)
+
+    zero_metrics = {
+        "acm_enabled": False,
+        "acm_status": "DISABLED",
+        "acm_invocations": 0,
+        "acm_compactions": 0,
+        "acm_observations_compacted": 0,
+        "acm_original_estimated_tokens": 0,
+        "acm_compacted_estimated_tokens": 0,
+        "acm_estimated_reduction_tokens": 0,
+        "acm_compaction_duration_ms": 0.0,
+    }
+
+    if not acm_enabled:
+        if isinstance(cm_stats, dict) and (cm_stats.get("total_compactions", 0) > 0 or cm_stats.get("total_estimated_tokens_saved", 0) > 0):
+            data_quality_issues.append("ACM disabled but cumulative stats report non-zero compactions")
+        return zero_metrics, data_quality_issues
+
+    call_invocations = 0
+    call_compactions = 0
+    call_obs_compacted = 0
+    call_orig_tokens = 0
+    call_comp_tokens = 0
+    call_reduction = 0
+    call_duration_ms = 0.0
+    has_msg_telemetry = False
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        extra = m.get("extra")
+        if not isinstance(extra, dict):
+            continue
+        if "context_compaction" not in extra:
+            continue
+
+        comp_meta = extra["context_compaction"]
+        if isinstance(comp_meta, str):
+            try:
+                comp_meta = json.loads(comp_meta)
+            except Exception:
+                data_quality_issues.append("Malformed context_compaction JSON in message extra")
+                continue
+
+        if not isinstance(comp_meta, dict):
+            data_quality_issues.append(f"Invalid context_compaction type: {type(comp_meta).__name__}")
+            continue
+
+        has_msg_telemetry = True
+        call_invocations += 1
+
+        comp_perf = bool(comp_meta.get("compaction_performed", False))
+        obs_comp = comp_meta.get("observations_compacted", 0)
+        orig_tok = comp_meta.get("original_estimated_tokens", 0)
+        comp_tok = comp_meta.get("compacted_estimated_tokens", 0)
+        red_tok = comp_meta.get("estimated_reduction_tokens", 0)
+        dur_ms = comp_meta.get("duration_ms", 0.0)
+
+        try:
+            obs_comp = int(obs_comp)
+            orig_tok = int(orig_tok)
+            comp_tok = int(comp_tok)
+            red_tok = int(red_tok)
+            dur_ms = float(dur_ms)
+        except (TypeError, ValueError):
+            data_quality_issues.append("Non-numeric value in message context_compaction telemetry")
+            continue
+
+        if orig_tok < 0 or comp_tok < 0 or red_tok < 0 or obs_comp < 0 or dur_ms < 0:
+            data_quality_issues.append("Negative value in message context_compaction telemetry")
+            obs_comp = max(0, obs_comp)
+            orig_tok = max(0, orig_tok)
+            comp_tok = max(0, comp_tok)
+            red_tok = max(0, red_tok)
+            dur_ms = max(0.0, dur_ms)
+
+        if comp_tok > orig_tok:
+            data_quality_issues.append(f"Compacted estimated tokens ({comp_tok}) exceed original ({orig_tok})")
+
+        if comp_perf or obs_comp > 0:
+            call_compactions += 1
+
+        call_obs_compacted += obs_comp
+        call_orig_tokens += orig_tok
+        call_comp_tokens += comp_tok
+        call_reduction += red_tok
+        call_duration_ms += dur_ms
+
+    has_info_stats = isinstance(cm_stats, dict) and bool(cm_stats)
+    info_compactions = 0
+    info_obs_compacted = 0
+    info_reduction = 0
+    info_duration_ms = 0.0
+
+    if has_info_stats:
+        try:
+            info_compactions = int(cm_stats.get("total_compactions", 0))
+            info_obs_compacted = int(cm_stats.get("total_observations_compacted", 0))
+            info_reduction = int(cm_stats.get("total_estimated_tokens_saved", 0))
+            info_duration_ms = float(cm_stats.get("total_compaction_time_ms", 0.0))
+            if info_compactions < 0 or info_obs_compacted < 0 or info_reduction < 0 or info_duration_ms < 0:
+                data_quality_issues.append("Negative value in context_manager_stats")
+                info_compactions = max(0, info_compactions)
+                info_obs_compacted = max(0, info_obs_compacted)
+                info_reduction = max(0, info_reduction)
+                info_duration_ms = max(0.0, info_duration_ms)
+        except (TypeError, ValueError):
+            data_quality_issues.append("Non-numeric value in context_manager_stats")
+            has_info_stats = False
+
+    if has_msg_telemetry and has_info_stats:
+        if call_compactions != info_compactions:
+            data_quality_issues.append(
+                f"ACM discrepancy: message compactions ({call_compactions}) != info ({info_compactions})"
+            )
+        if call_obs_compacted != info_obs_compacted:
+            data_quality_issues.append(
+                f"ACM discrepancy: message observations ({call_obs_compacted}) != info ({info_obs_compacted})"
+            )
+        if call_reduction != info_reduction:
+            data_quality_issues.append(
+                f"ACM discrepancy: message reduction ({call_reduction}) != info ({info_reduction})"
+            )
+        final_invocations = call_invocations
+        final_compactions = call_compactions
+        final_obs_compacted = call_obs_compacted
+        final_orig_tokens = call_orig_tokens
+        final_comp_tokens = call_comp_tokens
+        final_reduction = call_reduction
+        final_duration_ms = round(call_duration_ms, 3)
+
+    elif has_msg_telemetry:
+        final_invocations = call_invocations
+        final_compactions = call_compactions
+        final_obs_compacted = call_obs_compacted
+        final_orig_tokens = call_orig_tokens
+        final_comp_tokens = call_comp_tokens
+        final_reduction = call_reduction
+        final_duration_ms = round(call_duration_ms, 3)
+
+    elif has_info_stats:
+        final_invocations = info_compactions
+        final_compactions = info_compactions
+        final_obs_compacted = info_obs_compacted
+        final_orig_tokens = 0
+        final_comp_tokens = 0
+        final_reduction = info_reduction
+        final_duration_ms = round(info_duration_ms, 3)
+
+    else:
+        final_invocations = 0
+        final_compactions = 0
+        final_obs_compacted = 0
+        final_orig_tokens = 0
+        final_comp_tokens = 0
+        final_reduction = 0
+        final_duration_ms = 0.0
+
+    if final_compactions > 0 or final_reduction > 0:
+        status = "ENABLED_REDUCED"
+    else:
+        status = "ENABLED_NO_REDUCTION"
+
+    return {
+        "acm_enabled": True,
+        "acm_status": status,
+        "acm_invocations": final_invocations,
+        "acm_compactions": final_compactions,
+        "acm_observations_compacted": final_obs_compacted,
+        "acm_original_estimated_tokens": final_orig_tokens,
+        "acm_compacted_estimated_tokens": final_comp_tokens,
+        "acm_estimated_reduction_tokens": final_reduction,
+        "acm_compaction_duration_ms": final_duration_ms,
+    }, data_quality_issues
+
+
 def validate_trajectory(
     traj_path: Path,
     expected_task: str,
@@ -435,20 +658,32 @@ def validate_trajectory(
     # Verify configuration identity if metadata is present
     agent_cfg = info.get("config", {}).get("agent", {})
     if agent_cfg:
-        ld_enabled = agent_cfg.get("loop_detection", {}).get("enabled", False)
-        tf_enabled = agent_cfg.get("test_feedback", {}).get("enabled", False)
+        ld_enabled = bool(agent_cfg.get("loop_detection", {}).get("enabled", False))
+        tf_enabled = bool(agent_cfg.get("test_feedback", {}).get("enabled", False))
+        acm_enabled_cfg = bool(agent_cfg.get("adaptive_context", {}).get("enabled", False))
 
-        if expected_config == "A_baseline" and (ld_enabled or tf_enabled):
-            return False, None, "Config mismatch: expected baseline but feature enabled"
-        if expected_config == "B_loop_detection_only" and (not ld_enabled or tf_enabled):
-            return False, None, "Config mismatch: expected loop_detection_only"
-        if expected_config == "C_test_feedback_only" and (ld_enabled or not tf_enabled):
-            return False, None, "Config mismatch: expected test_feedback_only"
-        if expected_config == "D_combined" and (not ld_enabled or not tf_enabled):
-            return False, None, "Config mismatch: expected combined"
+        if expected_config in CONFIG_FEATURE_MATRIX:
+            expected_feats = CONFIG_FEATURE_MATRIX[expected_config]
+            actual_feats = {
+                "loop_detection": ld_enabled,
+                "test_feedback": tf_enabled,
+                "adaptive_context": acm_enabled_cfg,
+            }
+            for feat_name, exp_val in expected_feats.items():
+                if actual_feats[feat_name] != exp_val:
+                    return (
+                        False,
+                        None,
+                        f"Config mismatch: expected {feat_name}={exp_val} for {expected_config}, got {actual_feats[feat_name]}",
+                    )
+        else:
+            return False, None, f"Config mismatch: unknown configuration '{expected_config}'"
 
     # Extract metrics using robust observation parser and command association
     metrics = extract_trajectory_test_metrics(messages)
+    acm_metrics, acm_issues = extract_acm_metrics(messages, info, expected_config)
+    if acm_issues:
+        metrics["data_quality_issues"].extend(acm_issues)
 
     submitted = (exit_status == "Submitted")
     observed_test_success = metrics["observed_test_success"]
@@ -499,6 +734,15 @@ def validate_trajectory(
         "completion_tokens": metrics["completion_tokens"],
         "reasoning_tokens": metrics["reasoning_tokens"],
         "total_tokens": metrics["total_tokens"],
+        "acm_enabled": acm_metrics["acm_enabled"],
+        "acm_status": acm_metrics["acm_status"],
+        "acm_invocations": acm_metrics["acm_invocations"],
+        "acm_compactions": acm_metrics["acm_compactions"],
+        "acm_observations_compacted": acm_metrics["acm_observations_compacted"],
+        "acm_original_estimated_tokens": acm_metrics["acm_original_estimated_tokens"],
+        "acm_compacted_estimated_tokens": acm_metrics["acm_compacted_estimated_tokens"],
+        "acm_estimated_reduction_tokens": acm_metrics["acm_estimated_reduction_tokens"],
+        "acm_compaction_duration_ms": acm_metrics["acm_compaction_duration_ms"],
         "data_quality_issues": metrics["data_quality_issues"],
     }
 
@@ -563,6 +807,25 @@ def setup_task3(sandbox_dir: Path = SANDBOX_DIR) -> None:
     )
 
 
+def setup_task4(sandbox_dir: Path = SANDBOX_DIR) -> None:
+    """Task 4: Verbose codebase investigation task designed to test context compaction."""
+    cleanup_sandbox(sandbox_dir)
+    lines = [
+        '"""Extensive data transformation library."""',
+        "import math",
+        "",
+    ]
+    for i in range(1, 100):
+        lines.append(f"def helper_func_{i}(x: int) -> int:\n    \"\"\"Helper operation {i}.\"\"\"\n    return x + {i}\n")
+    lines.append("def calculate_metric(values: list[int]) -> int:\n    # Bug: returns sum instead of max\n    return sum(values)\n")
+    (sandbox_dir / "data_processor.py").write_text("\n".join(lines))
+    (sandbox_dir / "test_data_processor.py").write_text(
+        "from data_processor import calculate_metric\n\n"
+        "def test_calculate_metric():\n"
+        "    assert calculate_metric([1, 5, 2, 8, 3]) == 8\n"
+    )
+
+
 def cleanup_sandbox(sandbox_dir: Path = SANDBOX_DIR) -> None:
     for f in sandbox_dir.glob("*.py"):
         f.unlink()
@@ -607,11 +870,30 @@ TASKS = {
     },
 }
 
+ALL_TASKS = {
+    **TASKS,
+    "task4_verbose_investigation": {
+        "setup_fn": setup_task4,
+        "test_file": "test_data_processor.py",
+        "prompt": (
+            "There is a bug in calculate_metric() in data_processor.py causing test_data_processor.py to fail. "
+            "Please inspect the code, run pytest test_data_processor.py to analyze the failure, "
+            "fix calculate_metric in data_processor.py, re-verify with pytest test_data_processor.py, and submit your work."
+        ),
+    },
+}
+
 CONFIGS = {
     "A_baseline": "config/research/antigravity.yaml",
     "B_loop_detection_only": "config/research/antigravity_loop_detection.yaml",
     "C_test_feedback_only": "config/research/antigravity_test_feedback.yaml",
     "D_combined": "config/research/antigravity_combined.yaml",
+}
+
+ALL_CONFIGS = {
+    **CONFIGS,
+    "G_context_baseline": "config/research/antigravity_context_baseline.yaml",
+    "H_context_compaction": "config/research/antigravity_context_compaction.yaml",
 }
 
 
@@ -637,6 +919,13 @@ def compute_group_stats(runs: list[dict]) -> dict:
     failed_tests = [r.get("failed_test_runs", 0) for r in runs]
     passed_tests = [r.get("passed_test_runs", 0) for r in runs]
     rep_cmds = [r.get("repeated_commands", 0) for r in runs]
+    acm_invs = [r.get("acm_invocations", 0) for r in runs]
+    acm_comps = [r.get("acm_compactions", 0) for r in runs]
+    acm_obs = [r.get("acm_observations_compacted", 0) for r in runs]
+    acm_origs = [r.get("acm_original_estimated_tokens", 0) for r in runs]
+    acm_comps_tok = [r.get("acm_compacted_estimated_tokens", 0) for r in runs]
+    acm_reds = [r.get("acm_estimated_reduction_tokens", 0) for r in runs]
+    acm_durs = [r.get("acm_compaction_duration_ms", 0.0) for r in runs]
 
     m_steps = mean(steps)
     m_run = mean(runtimes)
@@ -647,6 +936,13 @@ def compute_group_stats(runs: list[dict]) -> dict:
     m_fail = mean(failed_tests)
     m_pass = mean(passed_tests)
     m_rep = mean(rep_cmds)
+    m_acm_inv = mean(acm_invs)
+    m_acm_comp = mean(acm_comps)
+    m_acm_obs = mean(acm_obs)
+    m_acm_orig = mean(acm_origs)
+    m_acm_comp_tok = mean(acm_comps_tok)
+    m_acm_red = mean(acm_reds)
+    m_acm_dur = mean(acm_durs)
 
     process_completed_count = sum(1 for r in runs if r.get("process_completed"))
     submitted_count = sum(1 for r in runs if r.get("submitted"))
@@ -696,6 +992,22 @@ def compute_group_stats(runs: list[dict]) -> dict:
         "total_tokens_std": round(std(t_toks, m_ttok), 2),
         "loop_detections_total": sum(r.get("loop_detections", 0) for r in runs),
         "feedbacks_generated_total": sum(r.get("feedbacks_generated", 0) for r in runs),
+        "acm_enabled_count": sum(1 for r in runs if r.get("acm_enabled")),
+        "acm_reduced_count": sum(1 for r in runs if r.get("acm_status") == "ENABLED_REDUCED"),
+        "acm_invocations_total": sum(acm_invs),
+        "acm_invocations_mean": round(m_acm_inv, 2),
+        "acm_compactions_total": sum(acm_comps),
+        "acm_compactions_mean": round(m_acm_comp, 2),
+        "acm_observations_compacted_total": sum(acm_obs),
+        "acm_observations_compacted_mean": round(m_acm_obs, 2),
+        "acm_original_estimated_tokens_total": sum(acm_origs),
+        "acm_original_estimated_tokens_mean": round(m_acm_orig, 2),
+        "acm_compacted_estimated_tokens_total": sum(acm_comps_tok),
+        "acm_compacted_estimated_tokens_mean": round(m_acm_comp_tok, 2),
+        "acm_estimated_reduction_tokens_total": sum(acm_reds),
+        "acm_estimated_reduction_tokens_mean": round(m_acm_red, 2),
+        "acm_compaction_duration_ms_total": round(sum(acm_durs), 3),
+        "acm_compaction_duration_ms_mean": round(m_acm_dur, 3),
     }
 
 
@@ -715,10 +1027,10 @@ class AblationExperimentRunner:
         task_filter: str | None = None,
         config_filter: str | None = None,
     ):
-        if task_filter is not None and task_filter not in TASKS:
-            raise ValueError(f"Invalid task filter '{task_filter}'. Must be one of: {list(TASKS.keys())}")
-        if config_filter is not None and config_filter not in CONFIGS:
-            raise ValueError(f"Invalid config filter '{config_filter}'. Must be one of: {list(CONFIGS.keys())}")
+        if task_filter is not None and task_filter not in ALL_TASKS:
+            raise ValueError(f"Invalid task filter '{task_filter}'. Must be one of: {list(ALL_TASKS.keys())}")
+        if config_filter is not None and config_filter not in ALL_CONFIGS:
+            raise ValueError(f"Invalid config filter '{config_filter}'. Must be one of: {list(ALL_CONFIGS.keys())}")
 
         self.sandbox_dir = sandbox_dir or SANDBOX_DIR
         self.timeout_seconds = timeout_seconds
@@ -729,8 +1041,16 @@ class AblationExperimentRunner:
         self.task_filter = task_filter
         self.config_filter = config_filter
 
-        self.active_tasks = {k: v for k, v in TASKS.items() if task_filter is None or k == task_filter}
-        self.active_configs = {k: v for k, v in CONFIGS.items() if config_filter is None or k == config_filter}
+        self.active_tasks = (
+            {task_filter: ALL_TASKS[task_filter]}
+            if task_filter is not None
+            else dict(TASKS)
+        )
+        self.active_configs = (
+            {config_filter: ALL_CONFIGS[config_filter]}
+            if config_filter is not None
+            else dict(CONFIGS)
+        )
 
         if output_dir:
             self.output_dir = output_dir
@@ -853,6 +1173,13 @@ class AblationExperimentRunner:
                                         "resolved": parsed["resolved"],
                                         "failed_test_runs": parsed["failed_test_runs"],
                                         "passed_test_runs": parsed["passed_test_runs"],
+                                        "acm_enabled": parsed.get("acm_enabled", False),
+                                        "acm_status": parsed.get("acm_status", "DISABLED"),
+                                        "acm_invocations": parsed.get("acm_invocations", 0),
+                                        "acm_compactions": parsed.get("acm_compactions", 0),
+                                        "acm_observations_compacted": parsed.get("acm_observations_compacted", 0),
+                                        "acm_estimated_reduction_tokens": parsed.get("acm_estimated_reduction_tokens", 0),
+                                        "acm_compaction_duration_ms": parsed.get("acm_compaction_duration_ms", 0.0),
                                         "trajectory_file": str(target_traj_path),
                                         "patch_file": patch_file_str,
                                         "snapshot_file": snapshot_file_str,
@@ -956,29 +1283,53 @@ class AblationExperimentRunner:
                             independent_verified=resolved,
                         )
                         if parsed is None:
+                            raw_metrics = None
+                            raw_acm = None
+                            traj_exit_status = "TIMEOUT" if run_diag["timed_out"] else "FAILED"
+                            if target_traj_path.exists():
+                                try:
+                                    t_data = json.loads(target_traj_path.read_text())
+                                    t_msgs = t_data.get("messages", [])
+                                    t_info = t_data.get("info", {})
+                                    if isinstance(t_msgs, list) and t_msgs:
+                                        raw_metrics = extract_trajectory_test_metrics(t_msgs)
+                                        raw_acm, _ = extract_acm_metrics(t_msgs, t_info, cfg_id)
+                                        traj_exit_status = t_info.get("exit_status") or traj_exit_status
+                                except Exception:
+                                    pass
+
                             parsed = {
                                 "trajectory": target_traj_path.name,
                                 "task": task_id,
                                 "config": cfg_id,
                                 "rep": rep,
-                                "exit_status": "TIMEOUT" if run_diag["timed_out"] else "FAILED",
-                                "submitted": False,
-                                "observed_test_success": False,
+                                "exit_status": traj_exit_status,
+                                "submitted": (traj_exit_status == "Submitted"),
+                                "observed_test_success": raw_metrics["observed_test_success"] if raw_metrics else False,
                                 "independent_resolved": resolved,
                                 "resolved": resolved,
-                                "total_steps": 0,
-                                "failed_test_runs": 0,
-                                "passed_test_runs": 0,
-                                "repeated_commands": 0,
+                                "total_steps": raw_metrics["total_steps"] if raw_metrics else 0,
+                                "failed_test_runs": raw_metrics["failed_test_runs"] if raw_metrics else 0,
+                                "passed_test_runs": raw_metrics["passed_test_runs"] if raw_metrics else 0,
+                                "repeated_commands": raw_metrics["repeated_commands"] if raw_metrics else 0,
                                 "loop_detections": 0,
                                 "interventions": 0,
                                 "feedbacks_generated": 0,
-                                "api_calls": 0,
-                                "prompt_tokens": 0,
-                                "completion_tokens": 0,
-                                "reasoning_tokens": 0,
-                                "total_tokens": 0,
-                                "data_quality_issues": [],
+                                "api_calls": raw_metrics["total_steps"] if raw_metrics else 0,
+                                "prompt_tokens": raw_metrics["prompt_tokens"] if raw_metrics else 0,
+                                "completion_tokens": raw_metrics["completion_tokens"] if raw_metrics else 0,
+                                "reasoning_tokens": raw_metrics["reasoning_tokens"] if raw_metrics else 0,
+                                "total_tokens": raw_metrics["total_tokens"] if raw_metrics else 0,
+                                "acm_enabled": raw_acm["acm_enabled"] if raw_acm else (cfg_id == "H_context_compaction"),
+                                "acm_status": raw_acm["acm_status"] if raw_acm else ("ENABLED_NO_REDUCTION" if cfg_id == "H_context_compaction" else "DISABLED"),
+                                "acm_invocations": raw_acm["acm_invocations"] if raw_acm else 0,
+                                "acm_compactions": raw_acm["acm_compactions"] if raw_acm else 0,
+                                "acm_observations_compacted": raw_acm["acm_observations_compacted"] if raw_acm else 0,
+                                "acm_original_estimated_tokens": raw_acm["acm_original_estimated_tokens"] if raw_acm else 0,
+                                "acm_compacted_estimated_tokens": raw_acm["acm_compacted_estimated_tokens"] if raw_acm else 0,
+                                "acm_estimated_reduction_tokens": raw_acm["acm_estimated_reduction_tokens"] if raw_acm else 0,
+                                "acm_compaction_duration_ms": raw_acm["acm_compaction_duration_ms"] if raw_acm else 0.0,
+                                "data_quality_issues": [f"Validation failure: {val_reason}"],
                             }
                         else:
                             parsed["independent_resolved"] = resolved
@@ -1006,6 +1357,15 @@ class AblationExperimentRunner:
                             "failed_test_runs": parsed.get("failed_test_runs", 0),
                             "passed_test_runs": parsed.get("passed_test_runs", 0),
                             "api_calls": parsed.get("api_calls", 0),
+                            "acm_enabled": parsed.get("acm_enabled", False),
+                            "acm_status": parsed.get("acm_status", "DISABLED"),
+                            "acm_invocations": parsed.get("acm_invocations", 0),
+                            "acm_compactions": parsed.get("acm_compactions", 0),
+                            "acm_observations_compacted": parsed.get("acm_observations_compacted", 0),
+                            "acm_original_estimated_tokens": parsed.get("acm_original_estimated_tokens", 0),
+                            "acm_compacted_estimated_tokens": parsed.get("acm_compacted_estimated_tokens", 0),
+                            "acm_estimated_reduction_tokens": parsed.get("acm_estimated_reduction_tokens", 0),
+                            "acm_compaction_duration_ms": parsed.get("acm_compaction_duration_ms", 0.0),
                             "status": run_diag["status"],
                             "timed_out": run_diag["timed_out"],
                             "validation_status": val_reason,
@@ -1179,8 +1539,17 @@ def verify_report_consistency(report: dict) -> list[str]:
         ("timed_out_count", "total_timed_out"),
         ("failed_test_runs_total", "total_failed_test_runs"),
         ("passed_test_runs_total", "total_passed_test_runs"),
+        ("acm_invocations_total", "total_acm_invocations"),
+        ("acm_compactions_total", "total_acm_compactions"),
+        ("acm_observations_compacted_total", "total_acm_observations_compacted"),
+        ("acm_estimated_reduction_tokens_total", "total_acm_estimated_reduction_tokens"),
     ]
     for sub_k, sum_k in task_field_map:
+        if sum_k not in summary:
+            if sum_k.startswith("total_acm_"):
+                continue
+            errors.append(f"Summary missing field '{sum_k}'")
+            continue
         t_sum = sum(t.get(sub_k, 0) for t in task_stats.values())
         if t_sum != summary.get(sum_k):
             errors.append(f"Task sum for {sub_k} ({t_sum}) != overall {sum_k} ({summary.get(sum_k)})")
@@ -1188,6 +1557,11 @@ def verify_report_consistency(report: dict) -> list[str]:
     # 4. Per-configuration counts equal overall counts
     cfg_stats = report.get("summary_by_config", {})
     for sub_k, sum_k in task_field_map:
+        if sum_k not in summary:
+            if sum_k.startswith("total_acm_"):
+                continue
+            errors.append(f"Summary missing field '{sum_k}'")
+            continue
         c_sum = sum(c["overall"].get(sub_k, 0) for c in cfg_stats.values())
         if c_sum != summary.get(sum_k):
             errors.append(f"Config sum for {sub_k} ({c_sum}) != overall {sum_k} ({summary.get(sum_k)})")
@@ -1210,6 +1584,89 @@ def verify_report_consistency(report: dict) -> list[str]:
     ind_true = summary.get("total_independent_resolved_true", 0)
     if f"{ind_true}/{vk}" not in narrative_blob:
         errors.append(f"Narrative missing verified correctness ratio '{ind_true}/{vk}'")
+
+    # 8. Adaptive Context Management telemetry consistency
+    for r in detailed_runs:
+        acm_en = r.get("acm_enabled", False)
+        acm_st = r.get("acm_status", "DISABLED")
+        compactions = r.get("acm_compactions", 0)
+        reduction = r.get("acm_estimated_reduction_tokens", 0)
+        orig_est = r.get("acm_original_estimated_tokens", 0)
+        comp_est = r.get("acm_compacted_estimated_tokens", 0)
+
+        if not acm_en:
+            if acm_st != "DISABLED":
+                errors.append(f"Run {r.get('trajectory')} has acm_enabled=False but status is '{acm_st}'")
+            if compactions > 0 or reduction > 0:
+                errors.append(f"Run {r.get('trajectory')} has acm_enabled=False but non-zero compaction stats")
+        else:
+            if acm_st == "DISABLED":
+                errors.append(f"Run {r.get('trajectory')} has acm_enabled=True but status is DISABLED")
+            if compactions > 0 or reduction > 0:
+                if acm_st != "ENABLED_REDUCED":
+                    errors.append(f"Run {r.get('trajectory')} has compactions/reductions but status is '{acm_st}'")
+            else:
+                if acm_st != "ENABLED_NO_REDUCTION":
+                    errors.append(f"Run {r.get('trajectory')} has 0 reductions but status is '{acm_st}'")
+
+        if comp_est > orig_est:
+            errors.append(f"Run {r.get('trajectory')} compacted tokens ({comp_est}) > original ({orig_est})")
+
+    # 9. Non-zero metrics consistency for runs with assistant steps and provider usage
+    for r in detailed_runs:
+        traj_name = r.get("trajectory")
+        traj_file_path = None
+        if traj_name:
+            if "source_directory" in report:
+                s_dir = Path(report["source_directory"])
+                for cand in (s_dir / "trajectories" / traj_name, s_dir / traj_name):
+                    if cand.exists():
+                        traj_file_path = cand
+                        break
+            elif Path(traj_name).exists():
+                traj_file_path = Path(traj_name)
+        if not traj_file_path and r.get("trajectory_path"):
+            cand = Path(r["trajectory_path"])
+            if cand.exists():
+                traj_file_path = cand
+
+        if traj_file_path and traj_file_path.exists():
+            try:
+                t_data = json.loads(traj_file_path.read_text())
+                msgs = t_data.get("messages", [])
+                has_assistant_steps = any(
+                    isinstance(m, dict) and m.get("role") == "assistant"
+                    for m in msgs
+                )
+                m_stats = t_data.get("info", {}).get("model_stats", {})
+                has_provider_usage = (
+                    m_stats.get("prompt_tokens", 0) > 0
+                    or m_stats.get("total_tokens", 0) > 0
+                    or any(
+                        isinstance(m, dict)
+                        and isinstance(m.get("extra", {}).get("response", {}).get("usage"), dict)
+                        and (m.get("extra", {}).get("response", {}).get("usage", {}).get("prompt_tokens", 0) or 0) > 0
+                        for m in msgs
+                    )
+                    or any(
+                        isinstance(m, dict)
+                        and isinstance(m.get("extra", {}).get("model_stats"), dict)
+                        and (m.get("extra", {}).get("model_stats", {}).get("prompt_tokens", 0) or 0) > 0
+                        for m in msgs
+                    )
+                )
+                if not r.get("timed_out") and (t_data.get("info", {}).get("exit_status") in VALID_TERMINAL_STATUSES):
+                    if has_assistant_steps and has_provider_usage:
+                        if r.get("total_steps", 0) == 0:
+                            errors.append(
+                                f"Run {traj_name} has total_steps=0 despite trajectory containing actual assistant steps and provider usage"
+                            )
+                        if r.get("prompt_tokens", 0) == 0:
+                            errors.append(
+                                f"Run {traj_name} has prompt_tokens=0 despite trajectory containing actual provider usage"
+                            )
+            except Exception:
+                pass
 
     return errors
 
@@ -1246,6 +1703,9 @@ def generate_markdown_evaluation_report(report: dict) -> str:
         f"| **Total Failed Test Executions** | {summary['total_failed_test_runs']} | — | pytest/unittest runs with non-zero exitcode |",
         f"| **Total Passed Test Executions** | {summary['total_passed_test_runs']} | — | pytest/unittest runs with exitcode 0 |",
         f"| **Mean Runtime (Seconds)** | {summary['mean_runtime_seconds']}s | — | Wall-clock duration recovered from manifest diagnostics & trajectory timestamps |",
+        f"| **ACM Requests Compacted** | {summary.get('total_acm_compactions', 0)} | — | Model dispatch requests where observation compaction was performed |",
+        f"| **ACM Folded Observations** | {summary.get('total_acm_observations_compacted', 0)} | — | Individual tool observation outputs shortened |",
+        f"| **ACM Estimated Token Reduction** | {summary.get('total_acm_estimated_reduction_tokens', 0)} | — | Heuristic token reduction estimate (provider prompt_tokens used for comparisons) |",
         "",
         "## Results by Configuration",
         "",
@@ -1282,6 +1742,29 @@ def generate_markdown_evaluation_report(report: dict) -> str:
 
     lines.extend([
         "",
+        "## Adaptive Context Management (ACM) Telemetry",
+        "",
+        "*Note: Token reductions shown below are heuristic estimates (1 token ≈ 4 characters). Provider-reported prompt_tokens are retained separately as the ground-truth standard for all experimental comparisons.*",
+        "",
+        "| Configuration | Runs | ACM Status | Invocations | Compactions | Obs. Compacted | Orig. Est. Tokens | Comp. Est. Tokens | Est. Token Reduction | Compaction Time (ms) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ])
+
+    for cfg_id, cfg_data in report["summary_by_config"].items():
+        stats = cfg_data["overall"]
+        cfg_runs = [r for r in report["detailed_runs"] if r.get("config") == cfg_id]
+        statuses = sorted(set(r.get("acm_status", "DISABLED") for r in cfg_runs))
+        status_label = "/".join(statuses) if statuses else "DISABLED"
+        lines.append(
+            f"| `{cfg_id}` | {stats['n_runs']} | `{status_label}` | "
+            f"{stats.get('acm_invocations_total', 0)} | {stats.get('acm_compactions_total', 0)} | "
+            f"{stats.get('acm_observations_compacted_total', 0)} | {stats.get('acm_original_estimated_tokens_total', 0)} | "
+            f"{stats.get('acm_compacted_estimated_tokens_total', 0)} | {stats.get('acm_estimated_reduction_tokens_total', 0)} | "
+            f"{stats.get('acm_compaction_duration_ms_total', 0.0)}ms |"
+        )
+
+    lines.extend([
+        "",
         "## Data Quality Limitations",
         "",
     ])
@@ -1292,18 +1775,19 @@ def generate_markdown_evaluation_report(report: dict) -> str:
         "",
         "## Detailed Run Breakdown",
         "",
-        "| Run (Task / Config / Rep) | Process Done | Exit Status | Submitted | Observed Pass | Independent Resolved | Timed Out | Failed Tests | Passed Tests | Runtime (s) | Steps | Tokens |",
-        "| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Run (Task / Config / Rep) | Process Done | Exit Status | Submitted | Observed Pass | Independent Resolved | Timed Out | Failed Tests | Passed Tests | Runtime (s) | Steps | Provider Tokens | ACM Status | Est. Saved Tokens |",
+        "| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
 
     for r in report["detailed_runs"]:
-        name = f"`{r['task']}` / `{r['config']}` / rep `{r['rep']}`"
+        name = f"`{r.get('task', 'unknown')}` / `{r.get('config', 'unknown')}` / rep `{r.get('rep', 0)}`"
         lines.append(
-            f"| {name} | {'✓' if r.get('process_completed') else '✗'} | `{r['exit_status']}` | "
-            f"{'✓' if r['submitted'] else '✗'} | {'✓' if r['observed_test_success'] else '✗'} | "
-            f"`{r['independent_resolved']}` | {'✓' if r.get('timed_out') else '✗'} | "
-            f"{r['failed_test_runs']} | {r['passed_test_runs']} | {r.get('runtime_seconds', 0.0)}s | "
-            f"{r['total_steps']} | {r['total_tokens']} |"
+            f"| {name} | {'✓' if r.get('process_completed') else '✗'} | `{r.get('exit_status', 'N/A')}` | "
+            f"{'✓' if r.get('submitted') else '✗'} | {'✓' if r.get('observed_test_success') else '✗'} | "
+            f"`{r.get('independent_resolved', 'UNKNOWN')}` | {'✓' if r.get('timed_out') else '✗'} | "
+            f"{r.get('failed_test_runs', 0)} | {r.get('passed_test_runs', 0)} | {r.get('runtime_seconds', 0.0)}s | "
+            f"{r.get('total_steps', 0)} | {r.get('total_tokens', 0)} | `{r.get('acm_status', 'DISABLED')}` | "
+            f"{r.get('acm_estimated_reduction_tokens', 0)} |"
         )
 
     return "\n".join(lines) + "\n"
@@ -1338,7 +1822,7 @@ def reprocess_trajectories(
             task_cfg = parts[0]
             cfg_id = None
             task_id = None
-            for c in CONFIGS:
+            for c in sorted(ALL_CONFIGS.keys(), key=len, reverse=True):
                 if task_cfg.endswith(f"_{c}"):
                     cfg_id = c
                     task_id = task_cfg[: -(len(c) + 1)]
@@ -1384,6 +1868,23 @@ def reprocess_trajectories(
         else:
             status_val = manifest_entry.get("status", "TIMEOUT") if manifest_entry else "TIMEOUT"
             exit_st = manifest_entry.get("agent_exit_status", status_val) if manifest_entry else status_val
+
+            raw_metrics = None
+            raw_acm = None
+            if not to_val and traj_file.exists():
+                try:
+                    content = traj_file.read_text()
+                    if content.strip():
+                        t_data = json.loads(content)
+                        t_msgs = t_data.get("messages", [])
+                        t_info = t_data.get("info", {})
+                        if isinstance(t_msgs, list) and t_msgs:
+                            raw_metrics = extract_trajectory_test_metrics(t_msgs)
+                            raw_acm, _ = extract_acm_metrics(t_msgs, t_info, cfg_id or "unknown")
+                            exit_st = t_info.get("exit_status") or exit_st
+                except Exception:
+                    pass
+
             timed_out_entry = {
                 "trajectory": traj_file.name,
                 "task": task_id,
@@ -1391,46 +1892,58 @@ def reprocess_trajectories(
                 "rep": rep,
                 "process_completed": proc_comp,
                 "exit_status": exit_st or status_val,
-                "submitted": False,
-                "observed_test_success": False,
-                "independent_resolved": False if independent_val != "UNKNOWN" else "UNKNOWN",
-                "resolved": False,
+                "submitted": (exit_st == "Submitted"),
+                "observed_test_success": raw_metrics["observed_test_success"] if raw_metrics else False,
+                "independent_resolved": independent_val if independent_val is not None else "UNKNOWN",
+                "resolved": (independent_val is True),
                 "timed_out": to_val,
                 "runtime_seconds": dur_val,
                 "start_time": start_iso,
                 "end_time": end_iso,
-                "total_steps": manifest_entry.get("api_calls", 0) if manifest_entry else 0,
-                "passed_test_runs": 0,
-                "failed_test_runs": 0,
-                "repeated_commands": 0,
+                "total_steps": raw_metrics["total_steps"] if raw_metrics else (manifest_entry.get("api_calls", 0) if manifest_entry else 0),
+                "passed_test_runs": raw_metrics["passed_test_runs"] if raw_metrics else 0,
+                "failed_test_runs": raw_metrics["failed_test_runs"] if raw_metrics else 0,
+                "repeated_commands": raw_metrics["repeated_commands"] if raw_metrics else 0,
                 "loop_detections": 0,
                 "interventions": 0,
                 "feedbacks_generated": 0,
                 "feedbacks_received_in_history": 0,
-                "api_calls": manifest_entry.get("api_calls", 0) if manifest_entry else 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "reasoning_tokens": 0,
-                "total_tokens": 0,
-                "data_quality_issues": [f"Run terminated abnormally: {reason}"],
+                "api_calls": raw_metrics["total_steps"] if raw_metrics else (manifest_entry.get("api_calls", 0) if manifest_entry else 0),
+                "prompt_tokens": raw_metrics["prompt_tokens"] if raw_metrics else 0,
+                "completion_tokens": raw_metrics["completion_tokens"] if raw_metrics else 0,
+                "reasoning_tokens": raw_metrics["reasoning_tokens"] if raw_metrics else 0,
+                "total_tokens": raw_metrics["total_tokens"] if raw_metrics else 0,
+                "acm_enabled": raw_acm["acm_enabled"] if raw_acm else (cfg_id == "H_context_compaction"),
+                "acm_status": raw_acm["acm_status"] if raw_acm else ("ENABLED_NO_REDUCTION" if cfg_id == "H_context_compaction" else "DISABLED"),
+                "acm_invocations": raw_acm["acm_invocations"] if raw_acm else 0,
+                "acm_compactions": raw_acm["acm_compactions"] if raw_acm else 0,
+                "acm_observations_compacted": raw_acm["acm_observations_compacted"] if raw_acm else 0,
+                "acm_original_estimated_tokens": raw_acm["acm_original_estimated_tokens"] if raw_acm else 0,
+                "acm_compacted_estimated_tokens": raw_acm["acm_compacted_estimated_tokens"] if raw_acm else 0,
+                "acm_estimated_reduction_tokens": raw_acm["acm_estimated_reduction_tokens"] if raw_acm else 0,
+                "acm_compaction_duration_ms": raw_acm["acm_compaction_duration_ms"] if raw_acm else 0.0,
+                "data_quality_issues": [f"Validation failure: {reason}"],
             }
             results.append(timed_out_entry)
-            overall_data_quality.append(f"Run {traj_file.name} terminated abnormally: {reason}")
+            overall_data_quality.append(f"Run {traj_file.name} validation failure: {reason}")
+
+    active_configs = [c for c in ALL_CONFIGS if any(r.get("config") == c for r in results)] or list(CONFIGS.keys())
+    active_tasks = [t for t in ALL_TASKS if any(r.get("task") == t for r in results)] or list(TASKS.keys())
 
     summary_by_config = {}
-    for cfg_id in CONFIGS:
+    for cfg_id in active_configs:
         cfg_runs = [r for r in results if r.get("config") == cfg_id]
         summary_by_config[cfg_id] = {
             "overall": compute_group_stats(cfg_runs),
             "by_task": {
                 task_id: compute_group_stats([r for r in cfg_runs if r.get("task") == task_id])
-                for task_id in TASKS
+                for task_id in active_tasks
             },
         }
 
     summary_by_task = {
         task_id: compute_group_stats([r for r in results if r.get("task") == task_id])
-        for task_id in TASKS
+        for task_id in active_tasks
     }
 
     total_runs = len(results)
@@ -1466,6 +1979,15 @@ def reprocess_trajectories(
         "total_passed_test_runs": total_passed_test_runs,
         "total_runtime_seconds": total_runtime_seconds,
         "mean_runtime_seconds": mean_runtime_seconds,
+        "total_acm_enabled_runs": sum(1 for r in results if r.get("acm_enabled")),
+        "total_acm_reduced_runs": sum(1 for r in results if r.get("acm_status") == "ENABLED_REDUCED"),
+        "total_acm_invocations": sum(r.get("acm_invocations", 0) for r in results),
+        "total_acm_compactions": sum(r.get("acm_compactions", 0) for r in results),
+        "total_acm_observations_compacted": sum(r.get("acm_observations_compacted", 0) for r in results),
+        "total_acm_original_estimated_tokens": sum(r.get("acm_original_estimated_tokens", 0) for r in results),
+        "total_acm_compacted_estimated_tokens": sum(r.get("acm_compacted_estimated_tokens", 0) for r in results),
+        "total_acm_estimated_reduction_tokens": sum(r.get("acm_estimated_reduction_tokens", 0) for r in results),
+        "total_acm_compaction_duration_ms": round(sum(r.get("acm_compaction_duration_ms", 0.0) for r in results), 3),
     }
 
     t1_runs = [r for r in results if r.get("task") == "task1_simple_assertion"]
@@ -1530,15 +2052,22 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Simulate run checks without invoking agents")
     parser.add_argument(
         "--task",
-        choices=["task1_simple_assertion", "task2_multi_failure", "task3_input_validation"],
+        choices=["task1_simple_assertion", "task2_multi_failure", "task3_input_validation", "task4_verbose_investigation"],
         default=None,
-        help="Optional task filter (task1_simple_assertion, task2_multi_failure, task3_input_validation)",
+        help="Optional task filter (task1_simple_assertion, task2_multi_failure, task3_input_validation, task4_verbose_investigation)",
     )
     parser.add_argument(
         "--config",
-        choices=["A_baseline", "B_loop_detection_only", "C_test_feedback_only", "D_combined"],
+        choices=[
+            "A_baseline",
+            "B_loop_detection_only",
+            "C_test_feedback_only",
+            "D_combined",
+            "G_context_baseline",
+            "H_context_compaction",
+        ],
         default=None,
-        help="Optional config filter (A_baseline, B_loop_detection_only, C_test_feedback_only, D_combined)",
+        help="Optional config filter (A_baseline, B_loop_detection_only, C_test_feedback_only, D_combined, G_context_baseline, H_context_compaction)",
     )
     parser.add_argument("--reprocess", type=Path, default=None, help="Reprocess trajectories from a run directory without LLM calls")
     parser.add_argument("--reprocess-output", type=Path, default=None, help="Path to save reprocessed report JSON")

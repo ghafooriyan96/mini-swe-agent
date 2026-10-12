@@ -12,6 +12,7 @@ from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
+from minisweagent.agents.utils.context_manager import AdaptiveContextConfig, AdaptiveContextManager
 from minisweagent.agents.utils.loop_detection import LoopDetectionConfig, LoopDetector
 from minisweagent.agents.utils.test_feedback import TestFeedbackConfig, TestOutputAnalyzer
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
@@ -39,6 +40,8 @@ class AgentConfig(BaseModel):
     """Loop detection configuration."""
     test_feedback: TestFeedbackConfig = TestFeedbackConfig()
     """Structured test feedback configuration."""
+    adaptive_context: AdaptiveContextConfig = AdaptiveContextConfig()
+    """Adaptive context management configuration."""
 
 
 class DefaultAgent:
@@ -57,6 +60,9 @@ class DefaultAgent:
         self.loop_detector = LoopDetector(self.config.loop_detection) if self.config.loop_detection.enabled else None
         self.test_feedback_analyzer = (
             TestOutputAnalyzer(self.config.test_feedback) if self.config.test_feedback.enabled else None
+        )
+        self.context_manager = (
+            AdaptiveContextManager(self.config.adaptive_context) if self.config.adaptive_context.enabled else None
         )
 
     def get_template_vars(self, **kwargs) -> dict:
@@ -103,6 +109,8 @@ class DefaultAgent:
             self.loop_detector.reset()
         if self.test_feedback_analyzer is not None:
             self.test_feedback_analyzer.reset()
+        if self.context_manager is not None:
+            self.context_manager.reset()
         self.add_messages(
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
             self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
@@ -160,8 +168,14 @@ class DefaultAgent:
                 }
             )
         self.n_calls += 1
-        message = self.model.query(self.messages)
+        messages_to_send = self.messages
+        compaction_meta = {}
+        if self.context_manager is not None:
+            messages_to_send, compaction_meta = self.context_manager.compact(self.messages)
+        message = self.model.query(messages_to_send)
         self.cost += message.get("extra", {}).get("cost", 0.0)
+        if compaction_meta:
+            message.setdefault("extra", {})["context_compaction"] = compaction_meta
         self.add_messages(message)
         return message
 
@@ -212,6 +226,8 @@ class DefaultAgent:
                 "feedbacks_generated": self.test_feedback_analyzer.total_feedbacks_generated,
                 "failed_tests_detected": self.test_feedback_analyzer.total_failed_tests_detected,
             }
+        if self.context_manager is not None:
+            agent_data["info"]["context_manager_stats"] = self.context_manager.get_stats()
         return recursive_merge(agent_data, self.model.serialize(), self.env.serialize(), *extra_dicts)
 
     def save(self, path: Path | None, *extra_dicts) -> dict:

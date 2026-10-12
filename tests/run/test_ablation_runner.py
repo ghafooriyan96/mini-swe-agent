@@ -15,7 +15,9 @@ from experiments.phase2_test_feedback.ablation_runner import (
     check_test_failed,
     check_test_passed,
     compute_group_stats,
+    extract_acm_metrics,
     extract_run_runtime_and_status,
+    generate_markdown_evaluation_report,
     is_test_command,
     parse_tool_observation,
     reprocess_trajectories,
@@ -897,5 +899,797 @@ def test_cli_replay_valid_snapshot_exits_status_0(tmp_path: Path):
     assert proc.returncode == 0
     assert "Traceback" not in proc.stderr
     assert "PASS (0)" in proc.stdout
+
+
+def test_acm_enabled_with_actual_reductions(tmp_path: Path):
+    traj_path = tmp_path / "traj_acm_reduced.json"
+    data = {
+        "info": {
+            "exit_status": "Submitted",
+            "config": {
+                "agent": {
+                    "loop_detection": {"enabled": True},
+                    "test_feedback": {"enabled": True},
+                    "adaptive_context": {"enabled": True},
+                }
+            },
+            "context_manager_stats": {
+                "enabled": True,
+                "total_compactions": 2,
+                "total_observations_compacted": 3,
+                "total_observations_protected": 1,
+                "total_estimated_tokens_saved": 450,
+                "total_compaction_time_ms": 1.5,
+            },
+            "model_stats": {"api_calls": 2},
+        },
+        "messages": [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Task prompt"},
+            {
+                "role": "assistant",
+                "content": "Step 1",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": True,
+                        "original_estimated_tokens": 600,
+                        "compacted_estimated_tokens": 350,
+                        "estimated_reduction_tokens": 250,
+                        "observations_compacted": 2,
+                        "observations_protected": 0,
+                        "duration_ms": 0.8,
+                    },
+                    "response": {
+                        "usage": {
+                            "prompt_tokens": 580,
+                            "completion_tokens": 30,
+                            "total_tokens": 610,
+                        }
+                    },
+                },
+            },
+            {"role": "tool", "content": json.dumps({"returncode": 1, "output": "error"})},
+            {
+                "role": "assistant",
+                "content": "Step 2",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": True,
+                        "original_estimated_tokens": 800,
+                        "compacted_estimated_tokens": 600,
+                        "estimated_reduction_tokens": 200,
+                        "observations_compacted": 1,
+                        "observations_protected": 1,
+                        "duration_ms": 0.7,
+                    },
+                    "response": {
+                        "usage": {
+                            "prompt_tokens": 780,
+                            "completion_tokens": 25,
+                            "total_tokens": 805,
+                        }
+                    },
+                },
+            },
+        ],
+    }
+    traj_path.write_text(json.dumps(data))
+    valid, parsed, reason = validate_trajectory(
+        traj_path,
+        expected_task="task4_verbose_investigation",
+        expected_config="H_context_compaction",
+    )
+    assert valid is True
+    assert parsed["acm_enabled"] is True
+    assert parsed["acm_status"] == "ENABLED_REDUCED"
+    assert parsed["acm_invocations"] == 2
+    assert parsed["acm_compactions"] == 2
+    assert parsed["acm_observations_compacted"] == 3
+    assert parsed["acm_original_estimated_tokens"] == 1400
+    assert parsed["acm_compacted_estimated_tokens"] == 950
+    assert parsed["acm_estimated_reduction_tokens"] == 450
+    assert parsed["acm_compaction_duration_ms"] == 1.5
+    # Provider-reported tokens strictly separate from estimates
+    assert parsed["prompt_tokens"] == 1360
+    assert parsed["completion_tokens"] == 55
+    assert parsed["total_tokens"] == 1415
+    assert parsed["data_quality_issues"] == []
+
+
+def test_acm_enabled_without_reductions(tmp_path: Path):
+    traj_path = tmp_path / "traj_acm_no_reduction.json"
+    data = {
+        "info": {
+            "exit_status": "Submitted",
+            "config": {
+                "agent": {
+                    "loop_detection": {"enabled": True},
+                    "test_feedback": {"enabled": True},
+                    "adaptive_context": {"enabled": True},
+                }
+            },
+            "context_manager_stats": {
+                "enabled": True,
+                "total_compactions": 0,
+                "total_observations_compacted": 0,
+                "total_observations_protected": 2,
+                "total_estimated_tokens_saved": 0,
+                "total_compaction_time_ms": 0.4,
+            },
+            "model_stats": {"api_calls": 1},
+        },
+        "messages": [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Task prompt"},
+            {
+                "role": "assistant",
+                "content": "Step 1",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": False,
+                        "original_estimated_tokens": 200,
+                        "compacted_estimated_tokens": 200,
+                        "estimated_reduction_tokens": 0,
+                        "observations_compacted": 0,
+                        "observations_protected": 2,
+                        "duration_ms": 0.4,
+                    },
+                    "response": {
+                        "usage": {
+                            "prompt_tokens": 210,
+                            "completion_tokens": 15,
+                            "total_tokens": 225,
+                        }
+                    },
+                },
+            },
+        ],
+    }
+    traj_path.write_text(json.dumps(data))
+    valid, parsed, reason = validate_trajectory(
+        traj_path,
+        expected_task="task1_simple_assertion",
+        expected_config="H_context_compaction",
+    )
+    assert valid is True
+    assert parsed["acm_enabled"] is True
+    assert parsed["acm_status"] == "ENABLED_NO_REDUCTION"
+    assert parsed["acm_invocations"] == 1
+    assert parsed["acm_compactions"] == 0
+    assert parsed["acm_observations_compacted"] == 0
+    assert parsed["acm_estimated_reduction_tokens"] == 0
+    assert parsed["data_quality_issues"] == []
+
+
+def test_acm_disabled_reports_zero(tmp_path: Path):
+    traj_path = tmp_path / "traj_acm_disabled.json"
+    data = {
+        "info": {
+            "exit_status": "Submitted",
+            "config": {
+                "agent": {
+                    "adaptive_context": {"enabled": False},
+                }
+            },
+            "model_stats": {"api_calls": 1},
+        },
+        "messages": [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Task prompt"},
+            {
+                "role": "assistant",
+                "content": "Step 1",
+                "extra": {
+                    "response": {
+                        "usage": {
+                            "prompt_tokens": 150,
+                            "completion_tokens": 20,
+                            "total_tokens": 170,
+                        }
+                    }
+                },
+            },
+        ],
+    }
+    traj_path.write_text(json.dumps(data))
+    valid, parsed, reason = validate_trajectory(
+        traj_path,
+        expected_task="task1_simple_assertion",
+        expected_config="A_baseline",
+    )
+    assert valid is True
+    assert parsed["acm_enabled"] is False
+    assert parsed["acm_status"] == "DISABLED"
+    assert parsed["acm_invocations"] == 0
+    assert parsed["acm_compactions"] == 0
+    assert parsed["acm_observations_compacted"] == 0
+    assert parsed["acm_original_estimated_tokens"] == 0
+    assert parsed["acm_compacted_estimated_tokens"] == 0
+    assert parsed["acm_estimated_reduction_tokens"] == 0
+    assert parsed["acm_compaction_duration_ms"] == 0.0
+    assert parsed["data_quality_issues"] == []
+
+
+def test_acm_multiple_model_calls_no_double_counting(tmp_path: Path):
+    traj_path = tmp_path / "traj_acm_multi_turn.json"
+    data = {
+        "info": {
+            "exit_status": "Submitted",
+            "config": {
+                "agent": {
+                    "loop_detection": {"enabled": True},
+                    "test_feedback": {"enabled": True},
+                    "adaptive_context": {"enabled": True},
+                }
+            },
+            "context_manager_stats": {
+                "enabled": True,
+                "total_compactions": 2,
+                "total_observations_compacted": 3,
+                "total_observations_protected": 2,
+                "total_estimated_tokens_saved": 250,
+                "total_compaction_time_ms": 3.0,
+            },
+            "model_stats": {"api_calls": 3},
+        },
+        "messages": [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Task prompt"},
+            {
+                "role": "assistant",
+                "content": "Turn 1",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": True,
+                        "original_estimated_tokens": 400,
+                        "compacted_estimated_tokens": 300,
+                        "estimated_reduction_tokens": 100,
+                        "observations_compacted": 1,
+                        "observations_protected": 0,
+                        "duration_ms": 1.0,
+                    },
+                },
+            },
+            {"role": "tool", "content": "output 1"},
+            {
+                "role": "assistant",
+                "content": "Turn 2",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": True,
+                        "original_estimated_tokens": 600,
+                        "compacted_estimated_tokens": 450,
+                        "estimated_reduction_tokens": 150,
+                        "observations_compacted": 2,
+                        "observations_protected": 1,
+                        "duration_ms": 1.2,
+                    },
+                },
+            },
+            {"role": "tool", "content": "output 2"},
+            {
+                "role": "assistant",
+                "content": "Turn 3",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": False,
+                        "original_estimated_tokens": 500,
+                        "compacted_estimated_tokens": 500,
+                        "estimated_reduction_tokens": 0,
+                        "observations_compacted": 0,
+                        "observations_protected": 1,
+                        "duration_ms": 0.8,
+                    },
+                },
+            },
+        ],
+    }
+    traj_path.write_text(json.dumps(data))
+    valid, parsed, reason = validate_trajectory(
+        traj_path,
+        expected_task="task4_verbose_investigation",
+        expected_config="H_context_compaction",
+    )
+    assert valid is True
+    assert parsed["acm_invocations"] == 3
+    assert parsed["acm_compactions"] == 2
+    assert parsed["acm_observations_compacted"] == 3
+    assert parsed["acm_estimated_reduction_tokens"] == 250
+    assert parsed["acm_compaction_duration_ms"] == 3.0
+    assert parsed["data_quality_issues"] == []
+
+
+def test_acm_missing_telemetry_backward_compatible(tmp_path: Path):
+    traj_path = tmp_path / "traj_missing_acm.json"
+    data = _make_sample_trajectory()
+    traj_path.write_text(json.dumps(data))
+    valid, parsed, reason = validate_trajectory(
+        traj_path,
+        expected_task="task1_simple_assertion",
+        expected_config="A_baseline",
+    )
+    assert valid is True
+    assert parsed["acm_enabled"] is False
+    assert parsed["acm_status"] == "DISABLED"
+    assert parsed["acm_invocations"] == 0
+    assert parsed["acm_compactions"] == 0
+    assert parsed["acm_observations_compacted"] == 0
+    assert parsed["acm_estimated_reduction_tokens"] == 0
+    assert parsed["data_quality_issues"] == []
+
+
+def test_acm_malformed_telemetry_handled_gracefully(tmp_path: Path):
+    traj_path = tmp_path / "traj_malformed_acm.json"
+    data = {
+        "info": {
+            "exit_status": "Submitted",
+            "config": {
+                "agent": {
+                    "loop_detection": {"enabled": True},
+                    "test_feedback": {"enabled": True},
+                    "adaptive_context": {"enabled": True},
+                }
+            },
+            "context_manager_stats": {
+                "enabled": True,
+                "total_compactions": "invalid_int",
+                "total_observations_compacted": -5,
+                "total_estimated_tokens_saved": "corrupted",
+                "total_compaction_time_ms": -1.0,
+            },
+            "model_stats": {"api_calls": 3},
+        },
+        "messages": [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "Task prompt"},
+            {
+                "role": "assistant",
+                "content": "Turn 1",
+                "extra": {
+                    "context_compaction": "not a json string",
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "Turn 2",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": True,
+                        "original_estimated_tokens": -50,
+                        "compacted_estimated_tokens": -20,
+                        "estimated_reduction_tokens": -30,
+                        "observations_compacted": -2,
+                        "duration_ms": -0.5,
+                    },
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "Turn 3",
+                "extra": {
+                    "context_compaction": {
+                        "enabled": True,
+                        "compaction_performed": True,
+                        "original_estimated_tokens": 100,
+                        "compacted_estimated_tokens": 300,
+                        "estimated_reduction_tokens": 0,
+                        "observations_compacted": 1,
+                        "duration_ms": 0.5,
+                    },
+                },
+            },
+        ],
+    }
+    traj_path.write_text(json.dumps(data))
+    valid, parsed, reason = validate_trajectory(
+        traj_path,
+        expected_task="task4_verbose_investigation",
+        expected_config="H_context_compaction",
+    )
+    assert valid is True
+    assert parsed is not None
+    assert parsed["acm_enabled"] is True
+    assert any("Malformed context_compaction" in issue for issue in parsed["data_quality_issues"])
+    assert any("Negative value" in issue for issue in parsed["data_quality_issues"])
+    assert any("Compacted estimated tokens" in issue for issue in parsed["data_quality_issues"])
+    assert parsed["acm_estimated_reduction_tokens"] >= 0
+    assert parsed["acm_compactions"] >= 0
+
+
+def test_acm_phase2_backward_compatibility():
+    run_dir = Path("experiments/phase2_test_feedback/runs/run_20261011_183454")
+    report = reprocess_trajectories(run_dir)
+    assert report["consistency_check"]["status"] == "PASSED"
+    summary = report["summary"]
+    assert summary["total_acm_enabled_runs"] == 0
+    assert summary["total_acm_reduced_runs"] == 0
+    assert summary["total_acm_invocations"] == 0
+    assert summary["total_acm_compactions"] == 0
+    assert summary["total_acm_observations_compacted"] == 0
+    assert summary["total_acm_estimated_reduction_tokens"] == 0
+    for r in report["detailed_runs"]:
+        assert r["acm_enabled"] is False
+        assert r["acm_status"] == "DISABLED"
+        assert r["acm_compactions"] == 0
+        assert r["acm_estimated_reduction_tokens"] == 0
+
+
+def test_acm_summary_correctness():
+    runs = [
+        {
+            "task": "task4_verbose_investigation",
+            "config": "H_context_compaction",
+            "rep": 1,
+            "process_completed": True,
+            "submitted": True,
+            "observed_test_success": True,
+            "independent_resolved": True,
+            "timed_out": False,
+            "failed_test_runs": 0,
+            "passed_test_runs": 1,
+            "runtime_seconds": 15.0,
+            "trajectory": "t1.json",
+            "acm_enabled": True,
+            "acm_status": "ENABLED_REDUCED",
+            "acm_invocations": 3,
+            "acm_compactions": 2,
+            "acm_observations_compacted": 3,
+            "acm_original_estimated_tokens": 1000,
+            "acm_compacted_estimated_tokens": 600,
+            "acm_estimated_reduction_tokens": 400,
+            "acm_compaction_duration_ms": 2.5,
+            "total_tokens": 1500,
+            "prompt_tokens": 1200,
+            "completion_tokens": 300,
+            "reasoning_tokens": 50,
+            "total_steps": 3,
+        },
+        {
+            "task": "task4_verbose_investigation",
+            "config": "H_context_compaction",
+            "rep": 2,
+            "process_completed": True,
+            "submitted": True,
+            "observed_test_success": True,
+            "independent_resolved": True,
+            "timed_out": False,
+            "failed_test_runs": 0,
+            "passed_test_runs": 1,
+            "runtime_seconds": 10.0,
+            "trajectory": "t2.json",
+            "acm_enabled": True,
+            "acm_status": "ENABLED_NO_REDUCTION",
+            "acm_invocations": 1,
+            "acm_compactions": 0,
+            "acm_observations_compacted": 0,
+            "acm_original_estimated_tokens": 200,
+            "acm_compacted_estimated_tokens": 200,
+            "acm_estimated_reduction_tokens": 0,
+            "acm_compaction_duration_ms": 0.5,
+            "total_tokens": 500,
+            "prompt_tokens": 400,
+            "completion_tokens": 100,
+            "reasoning_tokens": 20,
+            "total_steps": 1,
+        },
+        {
+            "task": "task4_verbose_investigation",
+            "config": "G_context_baseline",
+            "rep": 1,
+            "process_completed": True,
+            "submitted": True,
+            "observed_test_success": True,
+            "independent_resolved": True,
+            "timed_out": False,
+            "failed_test_runs": 0,
+            "passed_test_runs": 1,
+            "runtime_seconds": 20.0,
+            "trajectory": "t3.json",
+            "acm_enabled": False,
+            "acm_status": "DISABLED",
+            "acm_invocations": 0,
+            "acm_compactions": 0,
+            "acm_observations_compacted": 0,
+            "acm_original_estimated_tokens": 0,
+            "acm_compacted_estimated_tokens": 0,
+            "acm_estimated_reduction_tokens": 0,
+            "acm_compaction_duration_ms": 0.0,
+            "total_tokens": 1800,
+            "prompt_tokens": 1400,
+            "completion_tokens": 400,
+            "reasoning_tokens": 60,
+            "total_steps": 2,
+        },
+    ]
+
+    h_stats = compute_group_stats([runs[0], runs[1]])
+    g_stats = compute_group_stats([runs[2]])
+
+    assert h_stats["acm_enabled_count"] == 2
+    assert h_stats["acm_reduced_count"] == 1
+    assert h_stats["acm_invocations_total"] == 4
+    assert h_stats["acm_compactions_total"] == 2
+    assert h_stats["acm_observations_compacted_total"] == 3
+    assert h_stats["acm_estimated_reduction_tokens_total"] == 400
+    assert h_stats["acm_estimated_reduction_tokens_mean"] == 200.0
+
+    assert g_stats["acm_enabled_count"] == 0
+    assert g_stats["acm_reduced_count"] == 0
+    assert g_stats["acm_compactions_total"] == 0
+    assert g_stats["acm_estimated_reduction_tokens_total"] == 0
+
+    task_stats = compute_group_stats(runs)
+
+    summary = {
+        "total_runs": 3,
+        "total_process_completed": 3,
+        "total_submitted": 3,
+        "total_observed_test_success": 3,
+        "total_independent_resolved_true": 3,
+        "total_independent_resolved_false": 0,
+        "total_independent_resolved_unknown": 0,
+        "total_independent_verified_known": 3,
+        "total_timed_out": 0,
+        "total_failed_test_runs": 0,
+        "total_passed_test_runs": 3,
+        "total_runtime_seconds": 45.0,
+        "mean_runtime_seconds": 15.0,
+        "total_acm_enabled_runs": 2,
+        "total_acm_reduced_runs": 1,
+        "total_acm_invocations": 4,
+        "total_acm_compactions": 2,
+        "total_acm_observations_compacted": 3,
+        "total_acm_original_estimated_tokens": 1200,
+        "total_acm_compacted_estimated_tokens": 800,
+        "total_acm_estimated_reduction_tokens": 400,
+        "total_acm_compaction_duration_ms": 3.0,
+    }
+
+    report = {
+        "title": "ACM Summary Correctness Test Report",
+        "timestamp": "2026-10-12T00:00:00Z",
+        "source_directory": "/tmp/test",
+        "total_trajectories_evaluated": 3,
+        "summary": summary,
+        "summary_by_config": {
+            "H_context_compaction": {"overall": h_stats},
+            "G_context_baseline": {"overall": g_stats},
+        },
+        "summary_by_task": {
+            "task4_verbose_investigation": task_stats,
+        },
+        "data_quality_limitations": ["overall rate of verified runs is 3/3 = 100.0%"],
+        "detailed_runs": runs,
+    }
+
+    consistency_errors = verify_report_consistency(report)
+    assert consistency_errors == []
+
+    md_report = generate_markdown_evaluation_report(report)
+    assert "Adaptive Context Management (ACM) Telemetry" in md_report
+    assert "H_context_compaction" in md_report
+    assert "G_context_baseline" in md_report
+    assert "heuristic estimates" in md_report
+
+
+def test_real_gh_trajectory_validation_and_recovery():
+    g_path = Path("experiments/phase2_test_feedback/runs/run_20261012_010946/trajectories/traj_task4_verbose_investigation_G_context_baseline_rep1.json")
+    valid_g, parsed_g, reason_g = validate_trajectory(
+        g_path,
+        expected_task="task4_verbose_investigation",
+        expected_config="G_context_baseline",
+        expected_rep=1,
+        independent_verified=True,
+    )
+    assert valid_g is True
+    assert reason_g == "Verified complete trajectory"
+    assert parsed_g["total_steps"] == 15
+    assert parsed_g["prompt_tokens"] == 75077
+    assert parsed_g["completion_tokens"] == 734
+    assert parsed_g["reasoning_tokens"] == 3761
+    assert parsed_g["total_tokens"] == 79572
+    assert parsed_g["exit_status"] == "LimitsExceeded"
+    assert parsed_g["submitted"] is False
+    assert parsed_g["process_completed"] is True
+    assert parsed_g["independent_resolved"] is True
+    assert parsed_g["resolved"] is True
+    assert parsed_g["acm_enabled"] is False
+    assert parsed_g["acm_status"] == "DISABLED"
+    assert parsed_g["acm_compactions"] == 0
+    assert parsed_g["acm_estimated_reduction_tokens"] == 0
+
+    h_path = Path("experiments/phase2_test_feedback/runs/run_20261012_011253/trajectories/traj_task4_verbose_investigation_H_context_compaction_rep1.json")
+    valid_h, parsed_h, reason_h = validate_trajectory(
+        h_path,
+        expected_task="task4_verbose_investigation",
+        expected_config="H_context_compaction",
+        expected_rep=1,
+        independent_verified=True,
+    )
+    assert valid_h is True
+    assert reason_h == "Verified complete trajectory"
+    assert parsed_h["total_steps"] == 15
+    assert parsed_h["prompt_tokens"] == 81668
+    assert parsed_h["completion_tokens"] == 819
+    assert parsed_h["reasoning_tokens"] == 2557
+    assert parsed_h["total_tokens"] == 85044
+    assert parsed_h["exit_status"] == "LimitsExceeded"
+    assert parsed_h["submitted"] is False
+    assert parsed_h["process_completed"] is True
+    assert parsed_h["independent_resolved"] is True
+    assert parsed_h["resolved"] is True
+    assert parsed_h["acm_enabled"] is True
+    assert parsed_h["acm_status"] == "ENABLED_REDUCED"
+    assert parsed_h["acm_invocations"] == 15
+    assert parsed_h["acm_compactions"] == 5
+    assert parsed_h["acm_observations_compacted"] == 7
+    assert parsed_h["acm_original_estimated_tokens"] == 50273
+    assert parsed_h["acm_compacted_estimated_tokens"] == 44861
+    assert parsed_h["acm_estimated_reduction_tokens"] == 5412
+    assert parsed_h["acm_compaction_duration_ms"] > 7.0
+
+
+@pytest.mark.parametrize(
+    ("expected_cfg",),
+    [
+        ["A_baseline"],
+        ["B_loop_detection_only"],
+        ["C_test_feedback_only"],
+        ["D_combined"],
+        ["G_context_baseline"],
+    ],
+)
+def test_real_h_trajectory_configuration_mismatch_rejection(expected_cfg: str):
+    h_path = Path("experiments/phase2_test_feedback/runs/run_20261012_011253/trajectories/traj_task4_verbose_investigation_H_context_compaction_rep1.json")
+    valid, parsed, reason = validate_trajectory(
+        h_path,
+        expected_task="task4_verbose_investigation",
+        expected_config=expected_cfg,
+        expected_rep=1,
+    )
+    assert valid is False
+    assert parsed is None
+    assert "Config mismatch" in reason
+
+
+def test_synthetic_gh_feature_flag_mismatches(tmp_path: Path):
+    traj_path = tmp_path / "traj_gh_flags.json"
+    data = {
+        "info": {
+            "exit_status": "Submitted",
+            "config": {
+                "agent": {
+                    "loop_detection": {"enabled": True},
+                    "test_feedback": {"enabled": True},
+                    "adaptive_context": {"enabled": False},
+                }
+            },
+        },
+        "messages": [{"role": "system", "content": "prompt"}],
+    }
+    traj_path.write_text(json.dumps(data))
+    valid, parsed, reason = validate_trajectory(traj_path, "task4_verbose_investigation", "H_context_compaction")
+    assert valid is False
+    assert parsed is None
+    assert "expected adaptive_context=True for H_context_compaction, got False" in reason
+
+    data["info"]["config"]["agent"]["adaptive_context"]["enabled"] = True
+    traj_path.write_text(json.dumps(data))
+    valid_g, parsed_g, reason_g = validate_trajectory(traj_path, "task4_verbose_investigation", "G_context_baseline")
+    assert valid_g is False
+    assert parsed_g is None
+    assert "expected adaptive_context=False for G_context_baseline, got True" in reason_g
+
+
+def test_consistency_assertion_rejects_zero_steps_and_tokens_on_real_trajectory():
+    g_path = Path("experiments/phase2_test_feedback/runs/run_20261012_010946/trajectories/traj_task4_verbose_investigation_G_context_baseline_rep1.json")
+    _, parsed, _ = validate_trajectory(
+        g_path,
+        expected_task="task4_verbose_investigation",
+        expected_config="G_context_baseline",
+        expected_rep=1,
+        independent_verified=True,
+    )
+    assert parsed is not None
+
+    broken_run = dict(parsed)
+    broken_run["total_steps"] = 0
+    broken_report = {
+        "source_directory": "experiments/phase2_test_feedback/runs/run_20261012_010946",
+        "summary": {
+            "total_runs": 1,
+            "total_process_completed": 1,
+            "total_submitted": 0,
+            "total_observed_test_success": 0,
+            "total_independent_resolved_true": 1,
+            "total_independent_resolved_false": 0,
+            "total_independent_resolved_unknown": 0,
+            "total_independent_verified_known": 1,
+            "total_timed_out": 0,
+            "total_failed_test_runs": 1,
+            "total_passed_test_runs": 0,
+            "total_runtime_seconds": broken_run.get("runtime_seconds", 0.0),
+        },
+        "summary_by_config": {"G_context_baseline": {"overall": compute_group_stats([broken_run])}},
+        "summary_by_task": {"task4_verbose_investigation": compute_group_stats([broken_run])},
+        "data_quality_limitations": ["overall rate of verified runs is 1/1 = 100.0%"],
+        "detailed_runs": [broken_run],
+    }
+    errors = verify_report_consistency(broken_report)
+    assert any("total_steps=0 despite trajectory containing actual assistant steps" in e for e in errors)
+
+    broken_run2 = dict(parsed)
+    broken_run2["prompt_tokens"] = 0
+    broken_report2 = dict(broken_report)
+    broken_report2["detailed_runs"] = [broken_run2]
+    errors2 = verify_report_consistency(broken_report2)
+    assert any("prompt_tokens=0 despite trajectory containing actual provider usage" in e for e in errors2)
+
+
+def test_reprocess_gh_runs_recovers_nonzero_metrics_and_preserves_originals(tmp_path: Path):
+    g_dir = Path("experiments/phase2_test_feedback/runs/run_20261012_010946")
+    g_manifest_orig = (g_dir / "manifest.json").read_text()
+    g_results_orig = (g_dir / "ablation_results.json").read_text()
+
+    g_out_json = tmp_path / "g_report.json"
+    g_out_md = tmp_path / "g_report.md"
+    rep_g = reprocess_trajectories(g_dir, output_report_json=g_out_json, output_report_md=g_out_md)
+    assert rep_g["consistency_check"]["status"] == "PASSED"
+    assert rep_g["summary"]["total_runs"] == 1
+    assert rep_g["summary"]["total_process_completed"] == 1
+    assert rep_g["summary"]["total_submitted"] == 0
+    assert rep_g["summary"]["total_independent_resolved_true"] == 1
+    g_entry = rep_g["detailed_runs"][0]
+    assert g_entry["total_steps"] == 15
+    assert g_entry["prompt_tokens"] == 75077
+    assert g_entry["total_tokens"] == 79572
+    assert g_entry["exit_status"] == "LimitsExceeded"
+    assert g_entry["process_completed"] is True
+    assert g_entry["submitted"] is False
+    assert g_entry["independent_resolved"] is True
+    assert g_entry["acm_enabled"] is False
+
+    assert (g_dir / "manifest.json").read_text() == g_manifest_orig
+    assert (g_dir / "ablation_results.json").read_text() == g_results_orig
+
+    h_dir = Path("experiments/phase2_test_feedback/runs/run_20261012_011253")
+    h_manifest_orig = (h_dir / "manifest.json").read_text()
+    h_results_orig = (h_dir / "ablation_results.json").read_text()
+
+    h_out_json = tmp_path / "h_report.json"
+    h_out_md = tmp_path / "h_report.md"
+    rep_h = reprocess_trajectories(h_dir, output_report_json=h_out_json, output_report_md=h_out_md)
+    assert rep_h["consistency_check"]["status"] == "PASSED"
+    assert rep_h["summary"]["total_runs"] == 1
+    assert rep_h["summary"]["total_acm_compactions"] == 5
+    assert rep_h["summary"]["total_acm_observations_compacted"] == 7
+    assert rep_h["summary"]["total_acm_estimated_reduction_tokens"] == 5412
+    h_entry = rep_h["detailed_runs"][0]
+    assert h_entry["total_steps"] == 15
+    assert h_entry["prompt_tokens"] == 81668
+    assert h_entry["total_tokens"] == 85044
+    assert h_entry["exit_status"] == "LimitsExceeded"
+    assert h_entry["process_completed"] is True
+    assert h_entry["submitted"] is False
+    assert h_entry["independent_resolved"] is True
+    assert h_entry["acm_enabled"] is True
+    assert h_entry["acm_status"] == "ENABLED_REDUCED"
+    assert h_entry["acm_compactions"] == 5
+    assert h_entry["acm_observations_compacted"] == 7
+    assert h_entry["acm_estimated_reduction_tokens"] == 5412
+
+    assert (h_dir / "manifest.json").read_text() == h_manifest_orig
+    assert (h_dir / "ablation_results.json").read_text() == h_results_orig
+
+    md_content = g_out_md.read_text()
+    assert "Provider Tokens" in md_content
+    assert "Adaptive Context Management (ACM) Telemetry" in md_content
 
 
