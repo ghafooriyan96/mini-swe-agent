@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import pytest
 
@@ -741,3 +742,160 @@ def test_reprocess_existing_phase2_report_consistency():
     assert sum_data["total_failed_test_runs"] == 60
     assert sum_data["total_passed_test_runs"] == 77
     assert sum_data["total_runtime_seconds"] > 0.0
+
+
+def test_default_full_matrix_behavior(tmp_path: Path):
+    runner = AblationExperimentRunner(output_dir=tmp_path, dry_run=True, repetitions=1)
+    assert len(runner.active_tasks) == len(TASKS)
+    assert len(runner.active_configs) == len(CONFIGS)
+    summary = runner.execute_suite()
+    assert len(runner.manifest) == len(TASKS) * len(CONFIGS)
+    assert summary["total_runs"] == len(TASKS) * len(CONFIGS)
+    assert set(summary["summary_by_config"].keys()) == set(CONFIGS.keys())
+
+
+def test_task_only_filtering(tmp_path: Path):
+    runner = AblationExperimentRunner(
+        task_filter="task2_multi_failure",
+        output_dir=tmp_path,
+        dry_run=True,
+        repetitions=1,
+    )
+    assert len(runner.active_tasks) == 1
+    assert "task2_multi_failure" in runner.active_tasks
+    assert len(runner.active_configs) == len(CONFIGS)
+    summary = runner.execute_suite()
+    assert len(runner.manifest) == 4
+    assert all(m["task"] == "task2_multi_failure" for m in runner.manifest)
+    assert summary["total_runs"] == 4
+
+
+def test_config_only_filtering(tmp_path: Path):
+    runner = AblationExperimentRunner(
+        config_filter="C_test_feedback_only",
+        output_dir=tmp_path,
+        dry_run=True,
+        repetitions=1,
+    )
+    assert len(runner.active_tasks) == len(TASKS)
+    assert len(runner.active_configs) == 1
+    assert "C_test_feedback_only" in runner.active_configs
+    summary = runner.execute_suite()
+    assert len(runner.manifest) == 3
+    assert all(m["config"] == "C_test_feedback_only" for m in runner.manifest)
+    assert summary["total_runs"] == 3
+
+
+def test_combined_filtering_and_single_run_counting(tmp_path: Path, capsys):
+    runner = AblationExperimentRunner(
+        task_filter="task1_simple_assertion",
+        config_filter="D_combined",
+        repetitions=1,
+        output_dir=tmp_path,
+        dry_run=True,
+    )
+    assert len(runner.active_tasks) == 1
+    assert len(runner.active_configs) == 1
+    summary = runner.execute_suite()
+    assert len(runner.manifest) == 1
+    assert runner.manifest[0]["task"] == "task1_simple_assertion"
+    assert runner.manifest[0]["config"] == "D_combined"
+    assert summary["total_runs"] == 1
+    assert summary["task_filter"] == "task1_simple_assertion"
+    assert summary["config_filter"] == "D_combined"
+
+    captured = capsys.readouterr().out
+    assert "SINGLE-RUN EXECUTION SUMMARY" in captured
+    assert "Agent Exit Status:" in captured
+    assert "Independent Test Result:" in captured
+    assert "Snapshot Location:" in captured
+    assert "Patch Location:" in captured
+    assert "SHA-256 Integrity:" in captured
+
+
+def test_filtered_resume_behavior(tmp_path: Path):
+    resume_dir = tmp_path / "prior_traj"
+    resume_dir.mkdir()
+    sample_traj = _make_sample_trajectory(
+        exit_status="Submitted",
+        test_passed=True,
+        ld_enabled=True,
+        tf_enabled=True,
+    )
+    traj_file = resume_dir / "traj_task1_simple_assertion_D_combined_rep1.json"
+    traj_file.write_text(json.dumps(sample_traj))
+
+    runner = AblationExperimentRunner(
+        task_filter="task1_simple_assertion",
+        config_filter="D_combined",
+        repetitions=1,
+        resume=True,
+        resume_source=resume_dir,
+        output_dir=tmp_path / "new_run",
+        dry_run=True,
+    )
+    runner.execute_suite()
+    assert len(runner.manifest) == 1
+    assert runner.manifest[0]["status"] == "RESUMED_COMPLETE"
+    assert runner.manifest[0]["task"] == "task1_simple_assertion"
+    assert runner.manifest[0]["config"] == "D_combined"
+
+
+def test_invalid_task_and_config_values(tmp_path: Path):
+    with pytest.raises(ValueError, match="Invalid task filter"):
+        AblationExperimentRunner(output_dir=tmp_path, task_filter="invalid_task")
+
+    with pytest.raises(ValueError, match="Invalid config filter"):
+        AblationExperimentRunner(output_dir=tmp_path, config_filter="invalid_config")
+
+
+def test_cli_replay_invalid_path_exits_status_1_without_traceback():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-u",
+            "experiments/phase2_test_feedback/ablation_runner.py",
+            "--replay",
+            "nonexistent.snapshot.json",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 1
+    assert "Traceback" not in proc.stderr
+    assert "NameError" not in proc.stderr
+    assert "Snapshot file not found" in proc.stdout
+
+
+def test_cli_replay_valid_snapshot_exits_status_0(tmp_path: Path):
+    from experiments.phase2_test_feedback.workspace_preserver import WorkspacePreserver
+
+    ws = tmp_path / "sandbox"
+    ws.mkdir()
+    (ws / "math_mod.py").write_text("def add(a, b):\n    return a - b\n")
+    (ws / "test_math.py").write_text("from math_mod import add\ndef test_add():\n    assert add(2, 3) == 5\n")
+
+    preserver = WorkspacePreserver()
+    baseline = preserver.record_baseline(ws)
+    (ws / "math_mod.py").write_text("def add(a, b):\n    return a + b\n")
+    snapshot = preserver.capture_snapshot(ws, baseline)
+    _, snapshot_file = preserver.save_snapshot_and_patch(snapshot, tmp_path / "exp_out", "run_valid")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-u",
+            "experiments/phase2_test_feedback/ablation_runner.py",
+            "--replay",
+            str(snapshot_file),
+            "--replay-test-file",
+            "test_math.py",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0
+    assert "Traceback" not in proc.stderr
+    assert "PASS (0)" in proc.stdout
+
+

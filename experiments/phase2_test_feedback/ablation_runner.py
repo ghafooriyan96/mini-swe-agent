@@ -9,8 +9,22 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import time
 from typing import Any
+
+try:
+    from experiments.phase2_test_feedback.workspace_preserver import (
+        SecurityError,
+        WorkspacePreserver,
+        compute_sha256,
+    )
+except ImportError:
+    from workspace_preserver import (
+        SecurityError,
+        WorkspacePreserver,
+        compute_sha256,
+    )
 
 SANDBOX_DIR = Path("/Users/ehsang/projects/mini-agent-sandbox")
 REPO_DIR = Path("/Users/ehsang/projects/mini-swe-agent")
@@ -698,13 +712,25 @@ class AblationExperimentRunner:
         repetitions: int = 5,
         step_limit: int = 10,
         dry_run: bool = False,
+        task_filter: str | None = None,
+        config_filter: str | None = None,
     ):
+        if task_filter is not None and task_filter not in TASKS:
+            raise ValueError(f"Invalid task filter '{task_filter}'. Must be one of: {list(TASKS.keys())}")
+        if config_filter is not None and config_filter not in CONFIGS:
+            raise ValueError(f"Invalid config filter '{config_filter}'. Must be one of: {list(CONFIGS.keys())}")
+
         self.sandbox_dir = sandbox_dir or SANDBOX_DIR
         self.timeout_seconds = timeout_seconds
         self.resume = resume
         self.repetitions = repetitions
         self.step_limit = step_limit
         self.dry_run = dry_run
+        self.task_filter = task_filter
+        self.config_filter = config_filter
+
+        self.active_tasks = {k: v for k, v in TASKS.items() if task_filter is None or k == task_filter}
+        self.active_configs = {k: v for k, v in CONFIGS.items() if config_filter is None or k == config_filter}
 
         if output_dir:
             self.output_dir = output_dir
@@ -714,15 +740,42 @@ class AblationExperimentRunner:
 
         self.traj_dir = self.output_dir / "trajectories"
         self.logs_dir = self.output_dir / "logs"
+        self.patches_dir = self.output_dir / "patches"
+        self.snapshots_dir = self.output_dir / "snapshots"
+        self.manifests_dir = self.output_dir / "manifests"
+
         self.traj_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.patches_dir.mkdir(parents=True, exist_ok=True)
+        self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self.manifests_dir.mkdir(parents=True, exist_ok=True)
 
         self.manifest_file = self.output_dir / "manifest.json"
         self.results_file = self.output_dir / "ablation_results.json"
         self.resume_source = resume_source or EXP_DIR / "interrupted_run" / "trajectories"
 
+        self.preserver = WorkspacePreserver()
         self.manifest: list[dict] = []
         self.raw_results: list[dict] = []
+
+    def _find_prior_artifact(self, subdir: str, task_id: str, cfg_id: str, rep: int, ext: str) -> Path | None:
+        run_id = f"{task_id}_{cfg_id}_rep{rep}"
+        fname = f"{run_id}{ext}"
+        curr_p = self.output_dir / subdir / fname
+        if curr_p.exists():
+            return curr_p
+        if self.resume_source:
+            base = self.resume_source if self.resume_source.name != "trajectories" else self.resume_source.parent
+            src_p = base / subdir / fname
+            if src_p.exists():
+                return src_p
+            nested_p = self.resume_source / subdir / fname
+            if nested_p.exists():
+                return nested_p
+        fallback_p = EXP_DIR / subdir / fname
+        if fallback_p.exists():
+            return fallback_p
+        return None
 
     def _find_prior_trajectory(self, task_id: str, cfg_id: str, rep: int) -> Path | None:
         fname = f"traj_{task_id}_{cfg_id}_rep{rep}.json"
@@ -747,13 +800,13 @@ class AblationExperimentRunner:
         return None
 
     def execute_suite(self) -> dict:
-        total_runs = len(TASKS) * len(CONFIGS) * self.repetitions
+        total_runs = len(self.active_tasks) * len(self.active_configs) * self.repetitions
         run_num = 0
 
         with SandboxLock(self.sandbox_dir):
-            for task_id, task_meta in TASKS.items():
+            for task_id, task_meta in self.active_tasks.items():
                 print(f"\n==================== TASK: {task_id} ====================")
-                for cfg_id, cfg_file in CONFIGS.items():
+                for cfg_id, cfg_file in self.active_configs.items():
                     print(f"\n--- CONFIG: {cfg_id} ---")
                     for rep in range(1, self.repetitions + 1):
                         run_num += 1
@@ -773,8 +826,22 @@ class AblationExperimentRunner:
                                     if prior_path != target_traj_path:
                                         target_traj_path.write_text(prior_path.read_text())
                                     parsed["resumed"] = True
+                                    # Locate prior patch and snapshot if available
+                                    run_id = f"{task_id}_{cfg_id}_rep{rep}"
+                                    prior_patch = self._find_prior_artifact("patches", task_id, cfg_id, rep, ".patch")
+                                    prior_snapshot = self._find_prior_artifact("snapshots", task_id, cfg_id, rep, ".snapshot.json")
+                                    target_patch = self.patches_dir / f"{run_id}.patch"
+                                    target_snapshot = self.snapshots_dir / f"{run_id}.snapshot.json"
+                                    if prior_patch and prior_patch != target_patch:
+                                        target_patch.write_text(prior_patch.read_text(encoding="utf-8"), encoding="utf-8")
+                                    if prior_snapshot and prior_snapshot != target_snapshot:
+                                        target_snapshot.write_text(prior_snapshot.read_text(encoding="utf-8"), encoding="utf-8")
+
+                                    patch_file_str = str(target_patch) if target_patch.exists() else (str(prior_patch) if prior_patch else None)
+                                    snapshot_file_str = str(target_snapshot) if target_snapshot.exists() else (str(prior_snapshot) if prior_snapshot else None)
+
                                     self.raw_results.append(parsed)
-                                    self.manifest.append({
+                                    manifest_entry = {
                                         "task": task_id,
                                         "config": cfg_id,
                                         "rep": rep,
@@ -787,8 +854,13 @@ class AblationExperimentRunner:
                                         "failed_test_runs": parsed["failed_test_runs"],
                                         "passed_test_runs": parsed["passed_test_runs"],
                                         "trajectory_file": str(target_traj_path),
+                                        "patch_file": patch_file_str,
+                                        "snapshot_file": snapshot_file_str,
                                         "resumed": True,
-                                    })
+                                    }
+                                    self.manifest.append(manifest_entry)
+                                    run_manifest_file = self.manifests_dir / f"{run_id}.json"
+                                    atomic_write_json(run_manifest_file, manifest_entry)
                                     self._save_state()
                                     continue
                                 else:
@@ -796,19 +868,24 @@ class AblationExperimentRunner:
 
                         if self.dry_run:
                             print(f"[{run_num}/{total_runs}] [DRY RUN] Would execute {task_id} | {cfg_id} | rep {rep}")
-                            self.manifest.append({
+                            run_id = f"{task_id}_{cfg_id}_rep{rep}"
+                            dry_entry = {
                                 "task": task_id,
                                 "config": cfg_id,
                                 "rep": rep,
                                 "status": "DRY_RUN",
                                 "resumed": False,
-                            })
+                            }
+                            self.manifest.append(dry_entry)
+                            run_manifest_file = self.manifests_dir / f"{run_id}.json"
+                            atomic_write_json(run_manifest_file, dry_entry)
                             continue
 
                         print(f"[{run_num}/{total_runs}] Executing {task_id} | {cfg_id} | rep {rep} (timeout={self.timeout_seconds}s)...", end="", flush=True)
 
-                        # Set up clean task sandbox
+                        # Set up clean task sandbox and record baseline
                         task_meta["setup_fn"](self.sandbox_dir)
+                        baseline = self.preserver.record_baseline(self.sandbox_dir)
 
                         # Build command
                         cmd = [
@@ -839,6 +916,25 @@ class AblationExperimentRunner:
                             timeout_seconds=self.timeout_seconds,
                             stdout_file=stdout_log,
                             stderr_file=stderr_log,
+                        )
+
+                        # Immediately capture workspace state before external test or cleanup
+                        run_id = f"{task_id}_{cfg_id}_rep{rep}"
+                        snapshot = self.preserver.capture_snapshot(
+                            self.sandbox_dir,
+                            baseline,
+                            metadata={
+                                "task": task_id,
+                                "config": cfg_id,
+                                "rep": rep,
+                                "run_status": run_diag["status"],
+                                "timed_out": run_diag["timed_out"],
+                                "returncode": run_diag["returncode"],
+                                "duration_seconds": run_diag["duration_seconds"],
+                            },
+                        )
+                        patch_file, snapshot_file = self.preserver.save_snapshot_and_patch(
+                            snapshot, self.output_dir, run_id
                         )
 
                         # Independent external test evaluation
@@ -915,15 +1011,53 @@ class AblationExperimentRunner:
                             "validation_status": val_reason,
                             "stdout_log": str(stdout_log),
                             "stderr_log": str(stderr_log),
+                            "patch_file": str(patch_file),
+                            "snapshot_file": str(snapshot_file),
+                            "patch_sha256": snapshot.get("patch_sha256"),
+                            "modified_files": [f["path"] for f in snapshot.get("modified_files", [])],
+                            "created_files": [f["path"] for f in snapshot.get("created_files", [])],
+                            "deleted_files": [f["path"] for f in snapshot.get("deleted_files", [])],
                             "resumed": False,
                         }
                         self.manifest.append(diag_entry)
+                        run_manifest_file = self.manifests_dir / f"{run_id}.json"
+                        atomic_write_json(run_manifest_file, diag_entry)
                         self._save_state()
 
                         print(f" Done in {run_diag['duration_seconds']}s (Status: {run_diag['status']}, Resolved: {resolved}, Steps: {parsed.get('total_steps', 0)})")
 
             restore_sandbox_clean(self.sandbox_dir)
             print(f"\nAll experiments complete. Results recorded under {self.output_dir}")
+
+            if total_runs == 1 and self.manifest:
+                entry = self.manifest[-1]
+                patch_file_p = Path(entry.get("patch_file", "")) if entry.get("patch_file") else None
+                snap_file_p = Path(entry.get("snapshot_file", "")) if entry.get("snapshot_file") else None
+
+                sha_status = "UNKNOWN"
+                if patch_file_p and patch_file_p.exists() and snap_file_p and snap_file_p.exists():
+                    try:
+                        s_data = json.loads(snap_file_p.read_text(encoding="utf-8"))
+                        actual_sha = compute_sha256(patch_file_p.read_bytes())
+                        expected_sha = s_data.get("patch_sha256")
+                        sha_status = "VERIFIED" if actual_sha == expected_sha else f"MISMATCH (actual {actual_sha[:8]}, expected {expected_sha[:8]})"
+                    except Exception as e:
+                        sha_status = f"ERROR ({e})"
+
+                test_res_str = "PASS" if entry.get("independent_test_resolved") else ("SKIPPED (DRY RUN)" if entry.get("status") == "DRY_RUN" else "FAIL")
+
+                print("\n==================== SINGLE-RUN EXECUTION SUMMARY ====================")
+                print(f"Task:                    {entry.get('task')}")
+                print(f"Configuration:           {entry.get('config')}")
+                print(f"Agent Exit Status:       {entry.get('agent_exit_status') or entry.get('status')}")
+                print(f"Independent Test Result: {test_res_str}")
+                print(f"Snapshot Location:       {entry.get('snapshot_file')}")
+                print(f"Patch Location:          {entry.get('patch_file')}")
+                print(f"SHA-256 Integrity:       {sha_status}")
+                if entry.get("snapshot_file"):
+                    print(f"Replay Command:          python -u experiments/phase2_test_feedback/ablation_runner.py --replay {entry.get('snapshot_file')}")
+                print("======================================================================\n")
+
             return self._build_final_summary()
 
     def _save_state(self) -> None:
@@ -934,13 +1068,13 @@ class AblationExperimentRunner:
 
     def _build_final_summary(self) -> dict:
         summary_by_config = {}
-        for cfg_id in CONFIGS:
+        for cfg_id in self.active_configs:
             cfg_runs = [r for r in self.raw_results if r.get("config") == cfg_id]
             summary_by_config[cfg_id] = {
                 "overall": compute_group_stats(cfg_runs),
                 "by_task": {
                     task_id: compute_group_stats([r for r in cfg_runs if r.get("task") == task_id])
-                    for task_id in TASKS
+                    for task_id in self.active_tasks
                 },
             }
 
@@ -949,7 +1083,9 @@ class AblationExperimentRunner:
             "output_directory": str(self.output_dir),
             "timeout_seconds": self.timeout_seconds,
             "resumed": self.resume,
-            "total_runs": len(self.raw_results),
+            "task_filter": self.task_filter,
+            "config_filter": self.config_filter,
+            "total_runs": len(self.raw_results) if not self.dry_run else len(self.manifest),
             "summary_by_config": summary_by_config,
             "raw_runs": self.raw_results,
         }
@@ -1392,9 +1528,73 @@ def main():
     parser.add_argument("--repetitions", type=int, default=5, help="Repetitions per condition (default: 5)")
     parser.add_argument("--step-limit", type=int, default=10, help="Maximum step limit per agent run (default: 10)")
     parser.add_argument("--dry-run", action="store_true", help="Simulate run checks without invoking agents")
+    parser.add_argument(
+        "--task",
+        choices=["task1_simple_assertion", "task2_multi_failure", "task3_input_validation"],
+        default=None,
+        help="Optional task filter (task1_simple_assertion, task2_multi_failure, task3_input_validation)",
+    )
+    parser.add_argument(
+        "--config",
+        choices=["A_baseline", "B_loop_detection_only", "C_test_feedback_only", "D_combined"],
+        default=None,
+        help="Optional config filter (A_baseline, B_loop_detection_only, C_test_feedback_only, D_combined)",
+    )
     parser.add_argument("--reprocess", type=Path, default=None, help="Reprocess trajectories from a run directory without LLM calls")
     parser.add_argument("--reprocess-output", type=Path, default=None, help="Path to save reprocessed report JSON")
+    parser.add_argument("--replay", type=Path, default=None, help="Path to snapshot JSON or directory of snapshots to replay and verify offline")
+    parser.add_argument("--replay-patch", type=Path, default=None, help="Optional patch file to verify integrity against snapshot")
+    parser.add_argument("--replay-task", type=str, default=None, help="Optional task ID (task1_simple_assertion, task2_multi_failure, task3_input_validation)")
+    parser.add_argument("--replay-test-file", type=str, default=None, help="Optional test file to run during replay")
     args = parser.parse_args()
+
+    if args.replay:
+        preserver = WorkspacePreserver()
+        snapshots_to_replay = []
+        if args.replay.is_dir():
+            snapshots_to_replay = sorted(args.replay.glob("*.snapshot.json"))
+        else:
+            snapshots_to_replay = [args.replay]
+
+        if not snapshots_to_replay:
+            print(f"No snapshot files found at {args.replay}")
+            sys.exit(1)
+
+        overall_results = []
+        for snap_path in snapshots_to_replay:
+            task_id = args.replay_task
+            if not task_id:
+                try:
+                    s_data = json.loads(snap_path.read_text(encoding="utf-8"))
+                    task_id = s_data.get("metadata", {}).get("task")
+                except Exception:
+                    pass
+            setup_fn = TASKS[task_id]["setup_fn"] if task_id in TASKS else None
+            test_file = args.replay_test_file or (TASKS[task_id]["test_file"] if task_id in TASKS else None)
+            patch_path = args.replay_patch
+            if not patch_path:
+                candidate_patch = snap_path.parent.parent / "patches" / snap_path.name.replace(".snapshot.json", ".patch")
+                if candidate_patch.exists():
+                    patch_path = candidate_patch
+
+            res = preserver.replay_and_evaluate(
+                snapshot_path=snap_path,
+                setup_fn=setup_fn,
+                test_file=test_file,
+                patch_path=patch_path,
+            )
+            res["snapshot"] = str(snap_path)
+            overall_results.append(res)
+            print(f"Replay [{snap_path.name}]: {res['status']} ({res.get('returncode')}) - {res['explanation']}")
+
+        if len(overall_results) == 1:
+            if overall_results[0]["status"] != "PASS":
+                sys.exit(1)
+            sys.exit(0)
+        else:
+            passes = sum(1 for r in overall_results if r["status"] == "PASS")
+            print(f"Replay complete: {passes}/{len(overall_results)} PASS")
+            sys.exit(0 if passes == len(overall_results) else 1)
 
     if args.reprocess:
         out_json = args.reprocess_output or (args.reprocess / "reprocessed_evaluation_report.json")
@@ -1413,6 +1613,8 @@ def main():
         repetitions=args.repetitions,
         step_limit=args.step_limit,
         dry_run=args.dry_run,
+        task_filter=args.task,
+        config_filter=args.config,
     )
     runner.execute_suite()
 
