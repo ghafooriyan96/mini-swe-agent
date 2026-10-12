@@ -16,6 +16,8 @@ traj_*.json
 trajectory_*.json
 experiments/**/runs/
 experiments/**/interrupted_run/
+/experiments/phase3_adaptive_context/reports/
+
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python

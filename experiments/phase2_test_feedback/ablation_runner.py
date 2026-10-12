@@ -28,6 +28,8 @@ except ImportError:
 
 SANDBOX_DIR = Path("/Users/ehsang/projects/mini-agent-sandbox")
 REPO_DIR = Path("/Users/ehsang/projects/mini-swe-agent")
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
 EXP_DIR = REPO_DIR / "experiments" / "phase2_test_feedback"
 
 VALID_TERMINAL_STATUSES = {
@@ -882,6 +884,13 @@ ALL_TASKS = {
         ),
     },
 }
+
+try:
+    from experiments.phase3_adaptive_context.benchmark_tasks import PHASE3_BENCHMARK_TASKS
+    ALL_TASKS.update(PHASE3_BENCHMARK_TASKS)
+except ImportError:
+    pass
+
 
 CONFIGS = {
     "A_baseline": "config/research/antigravity.yaml",
@@ -2052,9 +2061,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Simulate run checks without invoking agents")
     parser.add_argument(
         "--task",
-        choices=["task1_simple_assertion", "task2_multi_failure", "task3_input_validation", "task4_verbose_investigation"],
+        choices=list(ALL_TASKS.keys()),
         default=None,
-        help="Optional task filter (task1_simple_assertion, task2_multi_failure, task3_input_validation, task4_verbose_investigation)",
+        help=f"Optional task filter ({', '.join(ALL_TASKS.keys())})",
     )
     parser.add_argument(
         "--config",
